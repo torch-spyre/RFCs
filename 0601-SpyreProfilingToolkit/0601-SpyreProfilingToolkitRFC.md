@@ -441,14 +441,14 @@ any compiler pass as specified by the user. This enables:
 3. **End-to-end mapping** — generate a mapping from PyTorch source code
    through the full compilation pipeline. The current pipeline is:
 
-   ```
+   ```text
    PyTorch source → FX Graph → LoopLevelIR → OpSpec → SuperDSC → device binary
    ```
 
    With the adoption of KTIR (RFC 0682), the pipeline will transition
    to:
 
-   ```
+   ```text
    PyTorch source → FX Graph → LoopLevelIR → KTIR → device binary
    ```
 
@@ -556,7 +556,7 @@ counters, which will be integrated into the profiler timeline:
 
 ## Code Structure
 
-```
+```text
 torch_spyre/profiling/
 ├── __init__.py                # Public API exports
 ├── core.py                    # Base profiling infrastructure and
@@ -636,46 +636,46 @@ are guarded by `try/except ImportError`.
    the highest level of instrumentation/profiling.
 
 2. **Accuracy & Determinism**:
-   1. Discrepancies with hardware counter / actual metric values within
-      defined bounds.
-   2. 100% identical results with and without profiling enabled.
-   3. No changes to kernel execution order, dataflow semantics, or
-      workload outputs.
+   * Discrepancies with hardware counter / actual metric values within
+     defined bounds.
+   * 100% identical results with and without profiling enabled.
+   * No changes to kernel execution order, dataflow semantics, or
+     workload outputs.
 
 3. **Actionable Performance Insights**:
-   1. Tools help identify optimization opportunities for each profiled
-      workload.
-   2. Proposed tools help perform fine-grained comparative analysis
-      with other accelerators, enabling detailed evaluation across
-      compute, memory, energy, and other metrics.
+   * Tools help identify optimization opportunities for each profiled
+     workload.
+   * Proposed tools help perform fine-grained comparative analysis
+     with other accelerators, enabling detailed evaluation across
+     compute, memory, energy, and other metrics.
 
 4. **Developer Adoption & Usability**:
-   1. Adoption: >80% of performance investigations by Spyre squads and
-      product teams use the proposed profiling tools.
-   2. Documentation: end-to-end guide with examples for common Spyre
-      workloads.
-   3. <5 minutes for a new user to install and begin using profiling
-      tools.
+   * Adoption: >80% of performance investigations by Spyre squads
+     and product teams use the proposed profiling tools.
+   * Documentation: end-to-end guide with examples for common Spyre
+     workloads.
+   * <5 minutes for a new user to install and begin using profiling
+     tools.
 
 5. **Coverage**:
-   1. For all workloads, distinguish between compute, memory, and
-      pipeline inefficiencies.
-   2. All key performance dimensions are captured: kernel execution
-      time, memory footprint, PT utilization, memory bandwidth, stalls,
-      inter-kernel pipeline gaps, intra-kernel stalls, and energy
-      consumption.
-   3. >90% of stalls/idle time classified (data dependency, scheduling,
-      or resource contention).
-   4. FFDC reduces manual reproduction requests by 40% and achieves
-      <5-minute MTTD for critical failures through always-on
-      monitoring.
+   * For all workloads, distinguish between compute, memory, and
+     pipeline inefficiencies.
+   * All key performance dimensions are captured: kernel execution
+     time, memory footprint, PT utilization, memory bandwidth,
+     stalls, inter-kernel pipeline gaps, intra-kernel stalls, and
+     energy consumption.
+   * >90% of stalls/idle time classified (data dependency,
+     scheduling, or resource contention).
+   * FFDC reduces manual reproduction requests by 40% and achieves
+     <5-minute MTTD for critical failures through always-on
+     monitoring.
 
 6. **Maintainability**:
-   1. >90% of new kernels or Spyre features should not require a major
-      redesign of the profiling tools.
-   2. >70% of profiling tools work should either be contributed to
-      existing open-source projects (e.g., Torch Inductor, Kineto, HTA)
-      or be open-sourced.
+   * >90% of new kernels or Spyre features should not require a
+     major redesign of the profiling tools.
+   * >70% of profiling tools work should either be contributed to
+     existing open-source projects (e.g., Torch Inductor, Kineto,
+     HTA) or be open-sourced.
 
 ## Drawbacks
 
