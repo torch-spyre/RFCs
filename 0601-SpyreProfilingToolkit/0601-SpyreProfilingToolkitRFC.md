@@ -9,24 +9,6 @@
 **Tracking issue:**
 [#1048](https://github.com/torch-spyre/torch-spyre/issues/1048)
 
-**Related issues/EPICs:**
-
-* [#601](https://github.com/torch-spyre/torch-spyre/issues/601) Spyre Profiling Toolkit (EPIC)
-
-* [#563](https://github.com/torch-spyre/torch-spyre/issues/563) Memory Profiling
-* [#596](https://github.com/torch-spyre/torch-spyre/issues/596) Nsight Compute Exploration
-* [#713](https://github.com/torch-spyre/torch-spyre/issues/713) Dataflow Hardware Metrics
-* [#714](https://github.com/torch-spyre/torch-spyre/issues/714) Testing Framework for Profiling
-* [#767](https://github.com/torch-spyre/torch-spyre/issues/767) PT Utilization Metric
-* [#769](https://github.com/torch-spyre/torch-spyre/issues/769) Dataflow Memory & Interconnect
-* [#836](https://github.com/torch-spyre/torch-spyre/issues/836) Open Source and Upstream
-* [#852](https://github.com/torch-spyre/torch-spyre/issues/852) CI/CD Profiling Pipeline
-* [#856](https://github.com/torch-spyre/torch-spyre/issues/856) Analysis Pipeline
-* [#857](https://github.com/torch-spyre/torch-spyre/issues/857) Observability & Telemetry
-* [#858](https://github.com/torch-spyre/torch-spyre/issues/858) Environment & Reproducibility
-* [#859](https://github.com/torch-spyre/torch-spyre/issues/859) Results Store & Visualisation
-* [#860](https://github.com/torch-spyre/torch-spyre/issues/860) HW Counter Export
-* [#924](https://github.com/torch-spyre/torch-spyre/issues/924) Profiling Overhead Benchmarking
 
 ---
 
