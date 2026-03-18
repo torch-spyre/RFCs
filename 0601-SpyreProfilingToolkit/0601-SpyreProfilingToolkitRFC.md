@@ -2,6 +2,8 @@
 
 **Authors:**
 
+* @aishwariyachakraborty
+* @seepgoel
 * @kaoutar55
 * @ppnaik1890
 * @flop1971
