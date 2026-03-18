@@ -2,15 +2,11 @@
 
 **Authors:**
 
-* @aishwariyachakraborty
-* @seepgoel
-* @kaoutar55
 * @ppnaik1890
+* @seepgoel
+* @aishwariyachakraborty
 * @flop1971
-
-**Tracking issue:**
-[#1048](https://github.com/torch-spyre/torch-spyre/issues/1048)
-
+* @kaoutar55
 
 ---
 
@@ -855,6 +851,6 @@ dataflow architectures.
 
 #### Tracking issue
 
-[#1048](https://github.com/torch-spyre/torch-spyre/issues/1048)
+<!-- TODO: Add tracking issue link -->
 
 #### Exceptions
