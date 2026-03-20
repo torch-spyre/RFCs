@@ -68,13 +68,13 @@ multiple tools working at different levels and granularities.
 
 ![Spyre Profiling Toolkit Architecture](spyre_profiling_toolkit.png)
 
-*Spyre Profiling Toolkit architecture showing how profiling
+*Figure1: Spyre Profiling Toolkit architecture showing how profiling
 tools interact with different layers of the stack — from the PyTorch
 application through the compiler frontend/backend, runtime, device
 driver, and hardware. The Profiling Tools Interface (libaiupti) serves
 as the central integration point, feeding data to the PyTorch Profiler
 (via LibKineto with Spyre Extension), the Holistic Trace Analyser, and
-Spyre SMI.*
+AIU SMI.*
 
 The toolkit spans the full stack:
 
@@ -84,10 +84,10 @@ The toolkit spans the full stack:
 | Compiler Frontend | Enhanced Inductor Provenance Tracking | Pass-level |
 | Compiler Backend | IR Instrumentation-based Fine-Grained Profiler | Intra-kernel |
 | Runtime | Profiling Tools Interface (libaiupti) | Kernel + memory |
-| Device Driver / HW | Spyre SMI | Device-level |
+| Device Driver / HW | AIU SMI | Device-level |
 | Post-processing | Holistic Trace Analyser for Spyre | Derived metrics |
 
-### Spyre SMI
+### AIU SMI
 
 We plan to build a System Management Interface (SMI) for Spyre,
 similar to NVIDIA-SMI, for monitoring Spyre devices. This tool will
@@ -116,15 +116,15 @@ $ spyre-smi
 ```
 -->
 
-Spyre SMI interacts with the runtime to obtain hardware and firmware information
-such as PTs utilized and memory usage of the device. We are evolving Spyre SMI to work with **libaiupti**, which
+AIU SMI interacts with the runtime to obtain hardware and firmware information
+such as PTs utilized and memory usage of the device. We are evolving AIU SMI to work with **libaiupti**, which
 will handle the hardware counter and VF mapping.
 
 ### Spyre Extension for PyTorch Profiler
 
 ![PyTorch Profiler Integration via PrivateUse1](profiler_integration_flow.png)
 
-*PyTorch Profiler integration flow showing how user code
+*Figure2:PyTorch Profiler integration flow showing how user code
 reaches Spyre hardware through the Kineto →
 REGISTER\_PRIVATEUSE1\_PROFILER → SpyreActivityProfiler → libaiupti
 path, with Flex control block timestamps as the timing source.*
@@ -225,7 +225,7 @@ This integration will provide:
 
 ![Spyre Dual-Memory Hierarchy](dual_memory_hierarchy.png)
 
-*Spyre's dual-memory hierarchy — DDR (device memory)
+*Figure3:Spyre's dual-memory hierarchy — DDR (device memory)
 managed by the runtime allocator and observable at runtime, and
 scratchpad (on-chip) managed by the compiler's LX planner and
 observable at both compile-time and runtime. DMA transfers move data
@@ -418,7 +418,7 @@ direct analog in von Neumann profiling:
 
 ![Compilation Pipeline with Profiling Hook Points](compilation_pipeline_hooks.png)
 
-*Compilation pipeline with profiling hook points — each
+*Figure4:Compilation pipeline with profiling hook points — each
 profiling tool attaches at a specific stage, from kernel-level PyTorch
 Profiler at the source through pass-level provenance tracking,
 intra-kernel IR instrumentation, to device-level hardware counters.
@@ -561,7 +561,7 @@ memory). The profiling toolkit must address:
 ### Energy and Power Profiling
 
 At 75W per card, energy efficiency is critical for enterprise
-deployments. Spyre SMI will expose power telemetry from hardware
+deployments. AIU SMI will expose power telemetry from hardware
 counters, which will be integrated into the profiler timeline:
 
 * **Per-kernel energy attribution** — correlate power draw with kernel
@@ -578,7 +578,7 @@ torch_spyre/profiling/
 ├── core.py                    # Base profiling infrastructure and
 │                              #   integration with PyTorch profiler
 ├── metrics.py                 # Metric definitions and collectors
-│                              #   (Spyre SMI integration)
+│                              #   (AIU SMI integration)
 ├── callbacks.py               # Profiling callbacks for different stages
 ├── reporters.py               # Result formatting and export
 └── utils.py                   # Helper utilities
@@ -632,11 +632,11 @@ are guarded by `try/except ImportError`.
 
 | # | Metric | Usage | Collected From | Status | Tool |
 |---|--------|-------|---------------|--------|------|
-| 1 | Peak and active memory | Tensor alloc + runtime + compiler alloc | Flex | Supported with PR | Spyre SMI |
-| 2 | MEM\_ALLOCATION\_SIZE, MEM\_TOTAL\_FREE\_SIZE, MEM\_TOTAL\_ALLOCATION\_SIZE | Memory alloc metrics (histogram) | Firmware | Blocked: histogram metric merge | Spyre SMI |
+| 1 | Peak and active memory | Tensor alloc + runtime + compiler alloc | Flex | Supported with PR | AIU SMI |
+| 2 | MEM\_ALLOCATION\_SIZE, MEM\_TOTAL\_FREE\_SIZE, MEM\_TOTAL\_ALLOCATION\_SIZE | Memory alloc metrics (histogram) | Firmware | Blocked: histogram metric merge | AIU SMI |
 | 3 | `torch.spyre.memory_allocated()`, `torch.spyre.max_memory_allocated()` | Tensor allocation | torch runtime | Supported with PR | PyTorch APIs |
 | 4 | Per-kernel PT utilization | Per-kernel PT utilization | Derived from deeptool logs + actual cycles from Flex (CB timestamps) | Needs rework: remove deeptool dependency | Profiler / aiu-trace-analyzer |
-| 5 | pt\_act | PT active utilization | Derived from power (HW counter) | Blocked: needs >27W power, equation rework needed | Spyre SMI |
+| 5 | pt\_act | PT active utilization | Derived from power (HW counter) | Blocked: needs >27W power, equation rework needed | AIU SMI |
 | 6 | Kernel cycle count | Cycles for DMI, compute, DMO phases | HW cycle counters -> Flex -> deeptools -> libaiupti | Possible, needs torch-spyre testing | Profiler |
 | 7 | Kernel duration | Time duration (nanoseconds) | Flex control block timestamps | Supported | Profiler |
 | 8 | Scratchpad utilization | Peak, average, fragmentation, reuse rate | torch-spyre runtime | Not supported | PyTorch API / aiu-trace-analyzer |
@@ -644,7 +644,7 @@ are guarded by `try/except ImportError`.
 | 10 | PCIe BW utilization | D2H / H2D bandwidth | HW counters + Flex | Supported in legacy, needs torch-spyre testing | aiu-trace-analyzer |
 | 11 | Roofline analysis | FLOP/s vs arithmetic intensity | HW counters + Flex | Not supported | aiu-trace-analyzer |
 | 12 | Queued/Submitted timestamp | Wait time in queue | Flex control block timestamps | Not supported | aiu-trace-analyzer |
-| 13 | LX queue size | Scratchpad memory load unit buffer size | Perf logout triggers | Not supported (planned for HW 1.5) | Spyre SMI / aiu-trace-analyzer |
+| 13 | LX queue size | Scratchpad memory load unit buffer size | Perf logout triggers | Not supported (planned for HW 1.5) | AIU SMI / aiu-trace-analyzer |
 
 ## Profiling Tool Metrics (Acceptance Criteria)
 
@@ -730,7 +730,7 @@ does not support intra-kernel analysis. This is insufficient for
 performance tuning on Spyre.
 
 **Avoiding IR instrumentation**: Limit profiling to runtime tools such
-as Spyre SMI, the profiler, and HTA, which provide execution traces
+as AIU SMI, the profiler, and HTA, which provide execution traces
 and hardware counters. However, this approach lacks compiler context,
 making it difficult to attribute performance issues in a kernel to
 specific lowering, fusion, or scheduling decisions, and limits support
@@ -822,7 +822,7 @@ dataflow architectures.
 ## How we teach this
 
 * **Terminology**: Use "Spyre Profiling Toolkit" as the umbrella term.
-  Individual tools keep their established names (Spyre SMI,
+  Individual tools keep their established names (AIU SMI,
   aiu-trace-analyzer, etc.).
 * **User guide**: `docs/profiling.md` will provide an end-to-end
   guide covering installation, basic profiling, memory profiling, trace
