@@ -1,5 +1,4 @@
-
-# RFC: Test Suite Configuration for running upstream pytorch tests from  OOT devices
+# RFC: Test Suite Configuration for running upstream pytorch tests from OOT devices
 
 **Authors:**
 
@@ -19,7 +18,9 @@ However, OOT devices typically support a subset of ops and dtypes, and some test
 This RFC defines a YAML-based configuration schema that allows an OOT device team to:
 
 - Declare which ops and dtypes their device supports
+- Declare which devices to test against (CPU, custom device, CUDA, etc.)
 - Select which upstream tests to run, skip, or mark as expected failures
+- Filter tests based on flexible criteria (ops, markers, patterns, etc.)
 - Allow the same framework to control, parameterise device specific custom tests
 - Express per-op and per-test tolerance overrides
 - Tag tests with model names and other metadata for traceability
@@ -65,7 +66,17 @@ such config files. `PYTORCH_TEST_CONFIG` will govern which config needs to be us
 test_suite_config:
   files:
     - ...   # one entry per upstream test file
+  
+  test_selectors:  # [Planned] - Advanced test filtering
+    include:
+      - ...
+    exclude:
+      - ...
+  
   global:
+    devices:
+      - cpu
+      - spyre
     
     supported_dtypes:
       - name: float16
@@ -79,7 +90,99 @@ test_suite_config:
 |---|---|---|
 | `test_suite_config` | Yes | Root key |
 | `files` | Yes | List of test file entries |
+| `test_selectors` | No | **[Planned]** Advanced test selection/filtering criteria. See §3.2 |
 | `global` | No | Device-wide capability declaration |
+
+### 3.2 Test Selectors *[Planned Feature]*
+
+**Status:** Not yet implemented
+
+Provides flexible test selection based on multiple criteria with include/exclude logic. This allows declarative control over which tests run without modifying test files.
+
+```yaml
+test_selectors:
+  include:
+    # OR between list items
+    - has_ops: true
+      ops_in_supported: true
+      # AND within each dict
+    
+    - markers:
+        - cuda
+        - slow
+      name_patterns:
+        - "test_conv*"
+        - "test_matmul*"
+  
+  exclude:
+    # OR between list items
+    - markers:
+        - slow
+    
+    - name_patterns:
+        - "test_deprecated_*"
+    
+    - has_ops: false  # Exclude non-op tests when global op list is active
+```
+
+#### Selection Criteria
+
+| Criterion | Type | Description |
+|---|---|---|
+| `has_ops` | bool | Test has `@ops` decorator |
+| `ops_in_supported` | bool | Test's ops are in `global.supported_ops` |
+| `markers` | list[str] | Pytest markers (e.g., `slow`, `cuda`, `skipif`) |
+| `name_patterns` | list[str] | Glob patterns for test names (e.g., `test_add*`) |
+| `module_patterns` | list[str] | Glob patterns for module paths (e.g., `test_ops*.py`) |
+| `decorators` | list[str] | Specific decorator names to match |
+
+#### Logic
+
+- **Include section**: Test must match at least ONE include rule (OR logic)
+  - Within each rule dict, ALL conditions must match (AND logic)
+- **Exclude section**: Test must NOT match ANY exclude rule
+- If no include rules specified: all tests included by default
+- Exclude rules are applied after include rules
+
+#### Use Cases
+
+**Scenario 1: Run only op-based tests that are supported**
+```yaml
+test_selectors:
+  include:
+    - has_ops: true
+      ops_in_supported: true
+```
+
+**Scenario 2: Exclude slow tests and deprecated tests**
+```yaml
+test_selectors:
+  exclude:
+    - markers:
+        - slow
+    - name_patterns:
+        - "test_deprecated_*"
+```
+
+**Scenario 3: Run specific test patterns for a model**
+```yaml
+test_selectors:
+  include:
+    - markers:
+        - model_resnet
+      name_patterns:
+        - "test_conv*"
+        - "test_batchnorm*"
+```
+
+**Scenario 4: Filter non-op tests when using global op list**
+```yaml
+test_selectors:
+  exclude:
+    - has_ops: false  # Skip tests without @ops decorator
+```
+
+This prevents failures when running `**/*.py` with a global op list — tests without ops are automatically filtered out.
 
 ---
 
@@ -96,7 +199,8 @@ Each entry under `files` corresponds to one test file.
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `path` | Yes | — | Path to the test file or a glob. Supports `${PYTORCH}` and `${TORCH_SPYRE}` tokens resolved from env vars `PYTORCH_ROOT` and `TORCH_SPYRE_ROOT` || `unlisted_test_mode` | No | `skip` | Mode applied to tests not listed under `tests`, or listed without an explicit `mode` |
+| `path` | Yes | — | Path to the test file or a glob. Supports `${PYTORCH}` and `${TORCH_SPYRE}` tokens resolved from env vars `PYTORCH_ROOT` and `TORCH_SPYRE_ROOT` |
+| `unlisted_test_mode` | No | `skip` | Mode applied to tests not listed under `tests`
 | `tests` | No | `[]` | List of test entries with explicit configuration |
 
 ### 4.1 `unlisted_test_mode`
@@ -127,7 +231,7 @@ Stable device, enforcing correctness:
 
 ## 5. Test Entry
 
-Each entry under `tests` configures a specific upstream test method. The same test can have multiple entires to define different combinations of behaviour if relevant. The final set will be the union of all tests.
+Each entry under `tests` configures a specific upstream test method. The same test can have multiple entries to define different combinations of behaviour if relevant. The final set will be the union of all tests.
 
 `tests.names` is an array of TEST_CLASS::test_method, so that the same config can be applied to multiple tests/class level etc if required.
 
@@ -267,13 +371,20 @@ Declares the device-wide capability.
 
 ```yaml
 global:
+  devices:
+    - cpu
+    - spyre
+    - cuda  # optional
+  
   supported_dtypes:
     - name: float16
     - name: int64
+  
   supported_ops:
     - name: add
       dtypes:
         - name: float16
+          precision:
             atol: 1e-3
             rtol: 1e-3
         - name: int64
@@ -285,16 +396,43 @@ global:
 
 | Field | Required | Description |
 |---|---|---|
-| `supported_dtypes` | Yes | Device-wide supported dtypes. |
+| `devices` | No | **[Planned]** List of devices to test against. See §6.1 |
+| `supported_dtypes` | Yes | Device-wide supported dtypes |
 | `supported_ops` | Yes | List of ops the device supports. Only ops listed here generate test variants |
 
-### 6.1 `supported_dtypes`
+### 6.1 `devices` *[Planned Feature]*
+
+**Status:** Not yet implemented
+
+Centralizes device configuration for all tests. Instead of hardcoding device names in individual tests or test base classes, the device list is declared once in the global configuration.
+
+```yaml
+global:
+  devices:
+    - cpu     # Reference device for comparison
+    - spyre   # Primary test target
+    - cuda    # Optional: if available
+```
+
+**Behaviour:**
+- Tests will be parametrized across all listed devices
+- Device availability is checked at runtime — unavailable devices are skipped with a clear message
+- Per-test device override may be supported via test-level `edits` (future extension)
+
+**Default:** If `devices` is not specified, defaults to `[cpu, spyre]` for backward compatibility.
+
+**Use cases:**
+- Test ops on multiple backends in a single run
+- Compare results between reference (CPU) and target device (spyre)
+- Conditionally include CUDA tests when hardware is available
+
+### 6.2 `supported_dtypes`
 
 The complete set of dtypes the device hardware supports. No test variant will run with a dtype outside this list will run, unless in the test specific config, it is explicitly set to include.
 
 If omitted, no dtype filtering is applied at the global level.
 
-### 6.2 `supported_ops`
+### 6.3 `supported_ops`
 
 Each entry declares one op the device supports and configures how tests exercising that op behave.
 
@@ -302,9 +440,9 @@ Each entry declares one op the device supports and configures how tests exercisi
 |---|---|---|---|
 | `name` | Yes | — | Op name matching `OpInfo.name` in upstream `op_db` |
 | `force_xfail` | No | `false` | If `true`, flips any `mandatory_success` variant for this op to `xfail`. Has no effect on variants already marked `xfail` or `xfail_strict` |
-| `dtypes` | No | `global.supported_dtypes` | Op-level dtype override. |
+| `dtypes` | No | `global.supported_dtypes` | Op-level dtype override |
 
-#### 6.2.1 `force_xfail` behaviour
+#### 6.3.1 `force_xfail` behaviour
 
 `force_xfail` operates at the **variant level**, not the test level. Since `@ops` generates one variant per `(op, dtype)` combination, `force_xfail` on an op affects only variants for that specific op:
 
@@ -326,7 +464,7 @@ test_scalar_support_gcd_float16:
 
 > **When to use `force_xfail: true`:** When an op is in `supported_ops` (so variants are generated) but is not yet stable enough to require passing. This allows tracking which tests exercise the op without committing to a correctness guarantee.
 
-#### 6.2.2 Op-level `dtypes`
+#### 6.3.2 Op-level `dtypes`
 
 Narrows the dtype variants generated for this op across all tests.
 
@@ -345,9 +483,80 @@ Precision overrides apply to all test variants for this `(op, dtype)` combinatio
 
 ---
 
-## 7. Scenarios
+## 7. Non-Op Test Filtering *[Planned Feature]*
 
-### 7.1 New model to be supported
+**Status:** Not yet implemented
+
+### 7.1 Problem
+
+When running with a global supported ops list and glob patterns like `**/*.py`, the framework collects **all** test files, including:
+
+1. Tests decorated with `@ops` that match supported ops ✓
+2. Tests decorated with `@ops` but with unsupported ops ✗
+3. Tests without `@ops` decorator (utility tests, sanity checks) ✗
+
+Currently, tests in categories 2 and 3 may fail or produce confusing errors because they don't match the filtering criteria.
+
+### 7.2 Solution
+
+Automatically filter out tests that don't have op-related decorators when a global op list is active. This prevents test collection/execution failures for non-op tests.
+
+### 7.3 Implementation Strategy
+
+Use `test_selectors` to declaratively filter non-op tests:
+
+```yaml
+test_selectors:
+  include:
+    - has_ops: true
+      ops_in_supported: true
+  
+  # Alternatively, exclude non-op tests explicitly:
+  exclude:
+    - has_ops: false
+```
+
+**Pytest integration:**
+- Use `pytest_collection_modifyitems` hook to inspect collected tests
+- Check for `@ops` decorator presence
+- Check if test's ops intersect with `global.supported_ops`
+- Skip tests that don't match with clear skip message
+
+### 7.4 Use Case Example
+
+```yaml
+test_suite_config:
+  files:
+    - path: ${PYTORCH}/test/**/*.py  # Glob pattern - collects everything
+      unlisted_test_mode: skip
+  
+  test_selectors:
+    include:
+      - has_ops: true
+        ops_in_supported: true
+  
+  global:
+    supported_ops:
+      - name: add
+      - name: mul
+```
+
+**Result:**
+- `test_add` with `@ops([add, mul, sub])` → runs (has ops, intersection with supported)
+- `test_utility_function` without `@ops` → skipped (no ops decorator)
+- `test_gcd` with `@ops([gcd])` → skipped (has ops, but `gcd` not in supported)
+
+**Skip message:**
+```
+SKIPPED [1] test_utils.py::test_utility_function: Test has no @ops decorator (filtered by test_selectors)
+SKIPPED [1] test_ops.py::test_gcd: Test ops ['gcd'] not in supported ops (filtered by test_selectors)
+```
+
+---
+
+## 8. Scenarios
+
+### 8.1 New model to be supported
 
 A model depends on `add` and `mul`. You want to run the tests that exercise these ops and verify they pass.
 
@@ -362,7 +571,7 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - my_model
-        - test: 
+        - names: 
             - TestBinaryUfuncs::test_contig_vs_transposed
           mode: mandatory_success
           tags:
@@ -388,7 +597,7 @@ Another model team wants to reuse the same op tests — they add their tag witho
     - another_model    # <- added, no other change needed
 ```
 
-### 7.2 New op supported by device
+### 8.2 New op supported by device
 
 `gcd` is newly supported. You want to run all upstream tests that exercise `gcd`, with failures expected while it stabilises.
 
@@ -414,7 +623,7 @@ test_suite_config:
 
 As `gcd` stabilises, flip `force_xfail: false` and move specific tests to `mandatory_success`.
 
-### 7.3 Known crash — suppress a specific test
+### 8.3 Known crash — suppress a specific test
 
 `test_add` causes a segfault. Block it entirely:
 
@@ -425,7 +634,7 @@ As `gcd` stabilises, flip `force_xfail: false` and move specific tests to `manda
   # Signal 11 - Segmentation fault
 ```
 
-### 7.4 Tolerance override for a specific op
+### 8.4 Tolerance override for a specific op
 
 `add` passes on `float16` but requires looser tolerance:
 
@@ -440,7 +649,7 @@ global:
             rtol: 1e-3
 ```
 
-### 7.5 Test uses a filtered op list — inject an op
+### 8.5 Test uses a filtered op list — inject an op
 
 `test_scalar_support` uses `binary_ufuncs_with_references` which only includes ops with a `ref`. If `gcd` has no `ref`, it is excluded from that list. To test it anyway:
 
@@ -455,9 +664,48 @@ global:
                         # include injects it into @ops.op_list for this test only
 ```
 
+### 8.6 Filter non-op tests with glob pattern *[Planned]*
+
+Running all test files but only want op-based tests:
+
+```yaml
+test_suite_config:
+  files:
+    - path: ${PYTORCH}/test/**/*.py  # Collect all test files
+      unlisted_test_mode: skip
+  
+  test_selectors:
+    include:
+      - has_ops: true
+        ops_in_supported: true
+  
+  global:
+    supported_ops:
+      - name: add
+      - name: mul
+```
+
+Result: Only tests with `@ops` decorator and ops in the supported list will run.
+
+### 8.7 Multi-device testing *[Planned]*
+
+Test ops on both CPU and spyre:
+
+```yaml
+global:
+  devices:
+    - cpu
+    - spyre
+  
+  supported_ops:
+    - name: add
+```
+
+Each test variant will run on both devices, enabling cross-device validation.
+
 ---
 
-## 8. Field Reference Summary
+## 9. Field Reference Summary
 
 ### File entry
 
@@ -471,19 +719,38 @@ global:
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `test` | string (`ClassName::method_name`) | Yes | — |
+| `names` | list of strings | Yes | — |
 | `mode` | enum | No | `mandatory_success` |
 | `tags` | list of strings | No | `[]` |
-| `edits.ops.include` | list of `{name}` | No | `[]` |
-| `edits.ops.exclude` | list of `{name}` | No | `[]` |
-| `edits.dtypes.include` | list of `{name}` | No | `[]` |
-| `edits.dtypes.exclude` | list of `{name}` | No | `[]` |
+| `edits.ops.include` | list of `{name, description?}` | No | `[]` |
+| `edits.ops.exclude` | list of `{name, description?}` | No | `[]` |
+| `edits.dtypes.include` | list of `{name, description?}` | No | `[]` |
+| `edits.dtypes.exclude` | list of `{name, description?}` | No | `[]` |
+
+### Test Selectors *[Planned]*
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `include` | list of selector dicts | No | `[]` |
+| `exclude` | list of selector dicts | No | `[]` |
+
+#### Selector Dict Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `has_ops` | bool | Test has `@ops` decorator |
+| `ops_in_supported` | bool | Test ops are in supported ops list |
+| `markers` | list of strings | Pytest marker names |
+| `name_patterns` | list of strings | Glob patterns for test names |
+| `module_patterns` | list of strings | Glob patterns for module paths |
+| `decorators` | list of strings | Decorator names to match |
 
 ### Global
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `supported_dtypes` | list of dtype strings | Yes | no filtering |
+| `devices` | list of strings | No | `[cpu, spyre]` |
+| `supported_dtypes` | list of dtype entries | Yes | no filtering |
 | `supported_ops` | list of op entries | Yes | no filtering |
 
 ### Supported op entry
@@ -492,7 +759,7 @@ global:
 |---|---|---|---|
 | `name` | string | Yes | — |
 | `force_xfail` | bool | No | `false` |
-| `dtypes` | list of `{name, precision}` | No | `supported_dtypes` |
+| `dtypes` | list of `{name, precision?}` | No | `supported_dtypes` |
 
 ### Precision
 
@@ -503,9 +770,9 @@ global:
 
 ---
 
-## 9. Validation Rules
+## 10. Validation Rules
 
-1. `name` must match `ClassName::method_name` pattern
+1. `names` must match `ClassName::method_name` pattern
 2. `mode` and `unlisted_test_mode` must be one of `mandatory_success`, `xfail`, `xfail_strict`, `skip`
 3. All dtype strings must be valid PyTorch dtype names
 4. `edits.dtypes.include` may be subset of `global.supported_dtypes` or mutually exclusive to `global.supported_dtypes`
@@ -513,10 +780,13 @@ global:
 6. If `supported_ops[*].dtypes` ∩ `global.supported_dtypes` is empty, a warning is emitted
 7. `tags` must be valid Python identifiers (used as pytest mark names)
 8. `path` tokens (`${PYTORCH}`, `${TORCH_SPYRE}`) must resolve via environment variables at load time
+9. `devices` must be valid device type strings (e.g., `cpu`, `cuda`, `spyre`, `privateuse1`)
+10. Test selector patterns must be valid glob patterns
+11. Test selector marker names must be valid pytest marker names
 
 ---
 
-## 10. Environment Variables
+## 11. Environment Variables
 
 | Variable | Description |
 |---|---|
@@ -527,10 +797,11 @@ global:
 | `TORCH_TEST_DEVICES` | Must point to `spyre_test_base_common.py` |
 | `PYTORCH_TEST_WITH_SLOW` | Must be set to `1` to enable slow tests like `test_compare_cpu` |
 
-## 11. Using the framework
-## Running Tests
+## 12. Using the framework
 
-### Environment Setup
+### Running Tests
+
+#### Environment Setup
 
 Export the required environment variables before running tests: (Please make sure you have torch-spyre and pytorch already cloned inside `DTI_PROJECT_ROOT` and are built properly).
 
@@ -560,7 +831,7 @@ export TORCH_SPYRE_ROOT="$DTI_PROJECT_ROOT/torch-spyre"
 
 **Note:** Replace `torch-spyre` with your actual fork repository name, if required.
 
-### Running Tests
+#### Running Tests
 
 Navigate to the PyTorch test directory and run tests:
 
@@ -569,7 +840,7 @@ cd $PYTORCH_ROOT/test/
 python3 -m pytest test_binary_ufuncs.py -v
 ```
 
-### Running Specific Test Subsets
+#### Running Specific Test Subsets
 
 ```bash
 # Run only tests tagged with a specific model
@@ -578,9 +849,11 @@ python3 -m pytest test_binary_ufuncs.py -v -m model_name_depending_on_this_test_
 # Run tests matching a specific pattern
 python3 -m pytest test_binary_ufuncs.py -v -k "test_scalar_support"
 
+# [Planned] Use test selectors for complex filtering
+# This will be automatic based on test_selectors in config
 ```
 
-### Environment Variables Reference
+#### Environment Variables Reference
 
 | Variable | Description |
 |----------|-------------|
@@ -590,13 +863,70 @@ python3 -m pytest test_binary_ufuncs.py -v -k "test_scalar_support"
 | `PYTORCH_ROOT` | Path to PyTorch source repository |
 | `TORCH_SPYRE_ROOT` | Path to torch-spyre repository |
 
-## Appendix: Complete Configuration Sample
+---
 
-The following example demonstrates every supported field in a single config file. It is intended as a reference — real configs will use only the fields relevant to their device and test coverage stage.
+## 13. Planned Features Summary
+
+The following features are documented in this RFC but not yet implemented:
+
+### 13.1 Global `devices` Configuration (§6.1)
+
+**Target:** Centralize device configuration
+
+**Benefits:**
+- Test across multiple devices in single run
+- Compare CPU vs custom device results
+- Conditional device inclusion based on availability
+
+
+### 13.2 Test Selectors (§3.2)
+
+**Target:** Advanced declarative test filtering
+
+**Benefits:**
+- Filter by ops, markers, patterns, decorators
+- Include/exclude logic with OR/AND combinations
+- No test file modification needed
+
+
+### 13.3 Non-Op Test Filtering (§7)
+
+**Target:** Automatically skip tests without `@ops` decorator
+
+**Benefits:**
+- Prevents failures when using glob patterns with global op list
+- Clear skip messages for filtered tests
+- Reduces test collection noise
+
+---
+
+## Appendix A: Complete Configuration Sample
+
+The following example demonstrates every supported field in a single config file, **including planned features**. It is intended as a reference — real configs will use only the fields relevant to their device and test coverage stage.
 
 ```yaml
 test_suite_config:
 
+  # ── Test Selectors [Planned] ──────────────────────────────────────────────
+  test_selectors:
+    include:
+      # OR between list items, AND within each dict
+      - has_ops: true
+        ops_in_supported: true
+      
+      - markers:
+          - model_resnet
+        name_patterns:
+          - "test_conv*"
+    
+    exclude:
+      - markers:
+          - slow
+          - requires_internet
+      
+      - has_ops: false  # Filter non-op tests
+
+  # ── File Entries ───────────────────────────────────────────────────────────
   files:
 
     # ── File 1: upstream binary ufunc tests ──────────────────────────────────
@@ -685,6 +1015,13 @@ test_suite_config:
   # ── Global: device-wide capability declaration ─────────────────────────────
   global:
 
+    # devices [Planned]: list of devices to test against
+    # Default: [cpu, spyre]
+    devices:
+      - cpu     # Reference device
+      - spyre   # Primary target
+      - cuda    # Optional: if available
+
     # supported_dtypes: positive list of dtypes the hardware supports.
     # Hard ceiling for the base dtype set across all tests.
     # Variants outside this list are skipped unless edits.dtypes.include overrides.
@@ -724,6 +1061,29 @@ test_suite_config:
         force_xfail: true
 ```
 
+---
+
+## Appendix B: Feature Implementation Roadmap
+
+### Phase 1: Current (Implemented)
+- File-level configuration with glob patterns
+- Test-level mode and tag configuration
+- Op and dtype edits (include/exclude)
+- Global supported ops and dtypes
+- Force xfail at op level
+- Precision overrides per op/dtype
+
+### Phase 2: Planned 
+- Global `devices` configuration (§6.1)
+- Non-op test filtering (§7)
+- Basic test selectors (§3.2) - `has_ops`, `ops_in_supported`
+- Advanced test selectors - markers, patterns
+- Per-test device overrides
+- Subprocess execution for test isolation
+- Configuration merge logic for layered configs
+
+---
+
 ### Dtype effective set (reference)
 
 ```
@@ -756,4 +1116,20 @@ pytest test_binary_ufuncs.py -m "model_2 and not model_1"
 
 # Exclude model_1 entirely
 pytest test_binary_ufuncs.py -m "not model_1"
+```
+
+### Test selectors example (reference) *[Planned]*
+
+```bash
+# Configured via YAML, executed automatically:
+test_selectors:
+  include:
+    - has_ops: true
+      ops_in_supported: true
+  exclude:
+    - markers:
+        - slow
+
+# No command-line flags needed — filtering is automatic
+pytest test_binary_ufuncs.py
 ```
