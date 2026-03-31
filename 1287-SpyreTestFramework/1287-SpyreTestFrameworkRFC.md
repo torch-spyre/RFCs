@@ -191,7 +191,7 @@ This prevents failures when running `**/*.py` with a global op list — tests wi
 Each entry under `files` corresponds to one test file.
 
 ```yaml
-- path: ${PYTORCH}/test/test_binary_ufuncs.py # or ${PYTORCH}/test/.*py
+- path: ${TORCH_ROOT}/test/test_binary_ufuncs.py # or ${TORCH_ROOT}/test/.*py
   unlisted_test_mode: skip
   tests:
     - ...
@@ -199,7 +199,7 @@ Each entry under `files` corresponds to one test file.
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `path` | Yes | — | Path to the test file or a glob. Supports `${PYTORCH}` and `${TORCH_SPYRE}` tokens resolved from env vars `PYTORCH_ROOT` and `TORCH_SPYRE_ROOT` |
+| `path` | Yes | — | Path to the test file or a glob. Supports `${TORCH_ROOT}` and `${TORCH_DEVICE_ROOT}` tokens resolved from env vars `PYTORCH_ROOT` and `TORCH_SPYRE_ROOT` |
 | `unlisted_test_mode` | No | `skip` | Mode applied to tests not listed under `tests`
 | `tests` | No | `[]` | List of test entries with explicit configuration |
 
@@ -527,7 +527,7 @@ test_selectors:
 ```yaml
 test_suite_config:
   files:
-    - path: ${PYTORCH}/test/**/*.py  # Glob pattern - collects everything
+    - path: ${TORCH_ROOT}/test/**/*.py  # Glob pattern - collects everything
       unlisted_test_mode: skip
   
   test_selectors:
@@ -563,7 +563,7 @@ A model depends on `add` and `mul`. You want to run the tests that exercise thes
 ```yaml
 test_suite_config:
   files:
-    - path: ${PYTORCH}/test/*.py
+    - path: ${TORCH_ROOT}/test/*.py
       unlisted_test_mode: skip
       tests:
         - names: 
@@ -604,7 +604,7 @@ Another model team wants to reuse the same op tests — they add their tag witho
 ```yaml
 test_suite_config:
   files:
-    - path: ${PYTORCH}/test/test_binary_ufuncs.py
+    - path: ${TORCH_ROOT}/test/test_binary_ufuncs.py
       unlisted_test_mode: xfail       # run everything, failures expected
       tests:
         - names:
@@ -671,7 +671,7 @@ Running all test files but only want op-based tests:
 ```yaml
 test_suite_config:
   files:
-    - path: ${PYTORCH}/test/**/*.py  # Collect all test files
+    - path: ${TORCH_ROOT}/test/**/*.py  # Collect all test files
       unlisted_test_mode: skip
   
   test_selectors:
@@ -779,7 +779,7 @@ Each test variant will run on both devices, enabling cross-device validation.
 5. `supported_ops[*].dtypes` must be a subset of `global.supported_dtypes`
 6. If `supported_ops[*].dtypes` ∩ `global.supported_dtypes` is empty, a warning is emitted
 7. `tags` must be valid Python identifiers (used as pytest mark names)
-8. `path` tokens (`${PYTORCH}`, `${TORCH_SPYRE}`) must resolve via environment variables at load time
+8. `path` tokens (`${TORCH_ROOT}`, `${TORCH_DEVICE_ROOT}`) must resolve via environment variables at load time
 9. `devices` must be valid device type strings (e.g., `cpu`, `cuda`, `spyre`, `privateuse1`)
 10. Test selector patterns must be valid glob patterns
 11. Test selector marker names must be valid pytest marker names
@@ -791,8 +791,8 @@ Each test variant will run on both devices, enabling cross-device validation.
 | Variable | Description |
 |---|---|
 | `PYTORCH_TEST_CONFIG` | Path to the YAML config file |
-| `PYTORCH_ROOT` | Resolves `${PYTORCH}` token in `path` |
-| `TORCH_SPYRE_ROOT` | Resolves `${TORCH_SPYRE}` token in `path` |
+| `PYTORCH_ROOT` | Resolves `${TORCH_ROOT}` token in `path` |
+| `TORCH_SPYRE_ROOT` | Resolves `${TORCH_DEVICE_ROOT}` token in `path` |
 | `PYTORCH_TESTING_DEVICE_ONLY_FOR` | Must be set to `privateuse1` |
 | `TORCH_TEST_DEVICES` | Must point to `spyre_test_base_common.py` |
 | `PYTORCH_TEST_WITH_SLOW` | Must be set to `1` to enable slow tests like `test_compare_cpu` |
@@ -801,7 +801,23 @@ Each test variant will run on both devices, enabling cross-device validation.
 
 ### Running Tests
 
-#### Environment Setup
+#### Single Command Line to run the test framework (Recommended Approach):
+
+The orchestrator script resides in torch-spyre/tests/
+
+- Please login to your spyre-enabled pod and `cd` to the `torch-spyre` directory (provide relative/absolute path based on your current path in the pod, in that case provide paths accordingly) 
+
+Command format: `bash /path/to/torch-spyre/tests/run_test.sh /path/to/tests/config`
+
+Below is an example:
+
+```bash
+bash tests/run_test.sh tests/configs/test_suite_config.yaml
+```
+
+This will run all the tests mentioned in the config. Please feel free to comment out / add / delete files that you dont want the framework to run.
+
+#### Environment Setup (Backward Compatibility -- in case you want to export your own environment variables)
 
 Export the required environment variables before running tests: (Please make sure you have torch-spyre and pytorch already cloned inside `DTI_PROJECT_ROOT` and are built properly).
 
@@ -930,7 +946,7 @@ test_suite_config:
   files:
 
     # ── File 1: upstream binary ufunc tests ──────────────────────────────────
-    - path: ${PYTORCH}/test/test_binary_ufuncs.py
+    - path: ${TORCH_ROOT}/test/test_binary_ufuncs.py
 
       # unlisted_test_mode controls tests NOT listed under `tests`.
       # skip = only tests explicitly listed below will run.
@@ -995,7 +1011,7 @@ test_suite_config:
           # Signal 11 - Segmentation fault on Spyre
 
     # ── File 2: upstream test_ops.py ─────────────────────────────────────────
-    - path: ${PYTORCH}/test/test_ops.py
+    - path: ${TORCH_ROOT}/test/test_ops.py
       unlisted_test_mode: skip
       tests:
 
