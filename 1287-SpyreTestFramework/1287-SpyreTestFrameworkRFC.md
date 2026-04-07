@@ -47,9 +47,9 @@ At collection time, `@ops` generates one test variant per `(op, dtype)` combinat
 The Spyre framework hooks into this mechanism via `SpyreTestBase` (which can eventually be contributed back to `PrivateUse1TestBase`) which:
 
 1. Loads the YAML config on first `instantiate_test` call
-2. Patches `@ops.op_list` directly to restrict which ops generate variants (`_SpyreOpListPatcher`)
-3. Patches `@onlyOn` to allow the `spyre` device type (`_SpyreOnlyOnPatcher`)
-4. Injects extra dtypes into `@ops.allowed_dtypes` (`_SpyreDtypePatcher`)
+2. Patches `@ops.op_list` directly to restrict which ops generate variants (`_OOTOpListPatcher`)
+3. Patches `@onlyOn` to allow the `spyre` device type (`_OOTOnlyOnPatcher`)
+4. Injects extra dtypes into `@ops.allowed_dtypes` (`_OOTDtypePatcher`)
 5. Applies skip, xfail, or mandatory_success to each generated variant
 6. Adds custom markers to tests for provenance.
 
@@ -67,12 +67,6 @@ test_suite_config:
   files:
     - ...   # one entry per upstream test file
   
-  test_selectors:  # [Planned] - Advanced test filtering
-    include:
-      - ...
-    exclude:
-      - ...
-  
   global:
     devices:
       - cpu
@@ -86,103 +80,13 @@ test_suite_config:
       - ...
 ```
 
+
+
 | Field | Required | Description |
 |---|---|---|
 | `test_suite_config` | Yes | Root key |
 | `files` | Yes | List of test file entries |
-| `test_selectors` | No | **[Planned]** Advanced test selection/filtering criteria. See §3.2 |
 | `global` | No | Device-wide capability declaration |
-
-### 3.2 Test Selectors *[Planned Feature]*
-
-**Status:** Not yet implemented
-
-Provides flexible test selection based on multiple criteria with include/exclude logic. This allows declarative control over which tests run without modifying test files.
-
-```yaml
-test_selectors:
-  include:
-    # OR between list items
-    - has_ops: true
-      ops_in_supported: true
-      # AND within each dict
-    
-    - markers:
-        - cuda
-        - slow
-      name_patterns:
-        - "test_conv*"
-        - "test_matmul*"
-  
-  exclude:
-    # OR between list items
-    - markers:
-        - slow
-    
-    - name_patterns:
-        - "test_deprecated_*"
-    
-    - has_ops: false  # Exclude non-op tests when global op list is active
-```
-
-#### Selection Criteria
-
-| Criterion | Type | Description |
-|---|---|---|
-| `has_ops` | bool | Test has `@ops` decorator |
-| `ops_in_supported` | bool | Test's ops are in `global.supported_ops` |
-| `markers` | list[str] | Pytest markers (e.g., `slow`, `cuda`, `skipif`) |
-| `name_patterns` | list[str] | Glob patterns for test names (e.g., `test_add*`) |
-| `module_patterns` | list[str] | Glob patterns for module paths (e.g., `test_ops*.py`) |
-| `decorators` | list[str] | Specific decorator names to match |
-
-#### Logic
-
-- **Include section**: Test must match at least ONE include rule (OR logic)
-  - Within each rule dict, ALL conditions must match (AND logic)
-- **Exclude section**: Test must NOT match ANY exclude rule
-- If no include rules specified: all tests included by default
-- Exclude rules are applied after include rules
-
-#### Use Cases
-
-**Scenario 1: Run only op-based tests that are supported**
-```yaml
-test_selectors:
-  include:
-    - has_ops: true
-      ops_in_supported: true
-```
-
-**Scenario 2: Exclude slow tests and deprecated tests**
-```yaml
-test_selectors:
-  exclude:
-    - markers:
-        - slow
-    - name_patterns:
-        - "test_deprecated_*"
-```
-
-**Scenario 3: Run specific test patterns for a model**
-```yaml
-test_selectors:
-  include:
-    - markers:
-        - model_resnet
-      name_patterns:
-        - "test_conv*"
-        - "test_batchnorm*"
-```
-
-**Scenario 4: Filter non-op tests when using global op list**
-```yaml
-test_selectors:
-  exclude:
-    - has_ops: false  # Skip tests without @ops decorator
-```
-
-This prevents failures when running `**/*.py` with a global op list — tests without ops are automatically filtered out.
 
 ---
 
@@ -243,6 +147,13 @@ tests:
     mode: xfail
     tags:
       - model_name_depending_on_this_test_1
+    selectors: # [Planned]
+      include:
+        - has_ops: true
+          ops_in_supported: true
+      exclude:
+        - markers:
+            - slow
     edits:
       ops:
         include:
@@ -250,6 +161,13 @@ tests:
             description: "add description for ops (optional)"
         exclude:
           - name: gcd
+      modules:                          # ← NEW field
+        include:
+          - name: torch.nn.BatchNorm2d
+            description: "add batchnorm even though not in global.supported_modules"
+        exclude:
+          - name: torch.nn.Linear
+            description: "Linear causes OOM on this test"
       dtypes:
         include:
           - name: float16
@@ -265,7 +183,8 @@ tests:
 | `names` | Yes | — | List of `ClassName::method_name` identifying the upstream test |
 | `mode` | No | `mandatory_success` | How to treat this test's variants |
 | `tags` | No | `[]` | Pytest mark labels applied to all variants of this test |
-| `edits` | No | — | Per-test overrides for ops and dtypes |
+| `selectors` | No | — | **[New, Planned]** Per-test filtering criteria. Replaces the former top-level `test_selectors`. Same schema — see §5.4 |
+| `edits` | No | — | Per-test overrides for ops, modules, and dtypes |
 
 ### 5.1 Test `mode`
 
@@ -324,7 +243,29 @@ edits:
 
 Both `include` and `exclude` are lists of dicts with `name` and `description (optional)` field, kept consistent for future extensibility (e.g. adding per-op precision overrides at the test level).
 
-#### 5.3.2 `edits.dtypes`
+#### 5.3.2 `edits.modules` 
+
+Controls which modules are included in `@modules.module_list` for this specific test. Mirrors the structure of `edits.ops`.
+
+```yaml
+edits:
+  modules:
+    include:
+      - name: torch.nn.BatchNorm2d
+        description: "add batchnorm even though not in global.supported_modules"
+    exclude:
+      - name: torch.nn.Linear
+        description: "Linear causes OOM on this test"
+```
+
+| Field | When to use |
+|---|---|
+| `include` | The module is not in `global.supported_modules`, but you want to test it for this specific test only. Injects the module into `@modules.module_list` at instantiation time |
+| `exclude` | The module is in `global.supported_modules` and in the test's module list, but you want to suppress it for this test only |
+
+Both fields accept a list of dicts with `name` (required, fully-qualified Python class path e.g. `torch.nn.BatchNorm2d`) and `description` (optional), consistent with `edits.ops` and `edits.dtypes`.
+
+#### 5.3.3 `edits.dtypes`
 
 Controls which dtype variants are generated for this test.
 
@@ -362,6 +303,106 @@ Where:
 - `edits.dtypes.include` — can be mutually exclusive to `global.supported_dtypes`, not necessarily a subset. It can be an additional dtype to
 test for a particular op without affecting other tests.
 - `edits.dtypes.exclude` — applied last, after all inclusions.
+
+### 5.4 Test Selectors *[Planned]*
+
+**Status:** Not yet implemented
+
+Provides flexible test selection based on multiple criteria with include/exclude logic. This allows declarative control over which tests run without modifying test files.
+
+```yaml
+- names:
+    - TestBinaryUfuncs::test_scalar_support
+  mode: mandatory_success
+  selectors:
+    include:
+      # OR between list items
+      - has_ops: true
+        ops_in_supported: true
+        # AND within each dict
+      
+      - markers:
+          - cuda
+          - slow
+        name_patterns:
+          - "test_conv*"
+          - "test_matmul*"
+    
+    exclude:
+      # OR between list items
+      - markers:
+          - slow
+      
+      - name_patterns:
+          - "test_deprecated_*"
+      
+      - has_ops: false  # Exclude non-op tests when global op list is active
+```
+
+#### Selection Criteria
+
+| Criterion | Type | Description |
+|---|---|---|
+| `has_ops` | bool | Test has `@ops` decorator |
+| `ops_in_supported` | bool | Test's ops are in `global.supported_ops` |
+| `markers` | list[str] | Pytest markers (e.g., `slow`, `cuda`, `skipif`) |
+| `name_patterns` | list[str] | Glob patterns for test names (e.g., `test_add*`) |
+| `module_patterns` | list[str] | Glob patterns for module paths (e.g., `test_ops*.py`) |
+| `decorators` | list[str] | Specific decorator names to match |
+
+#### Logic
+
+- **Include section**: Test must match at least ONE include rule (OR logic)
+  - Within each rule dict, ALL conditions must match (AND logic)
+- **Exclude section**: Test must NOT match ANY exclude rule
+- If no include rules specified: all tests included by default
+- Exclude rules are applied after include rules
+
+#### Use Cases
+
+**Scenario 1: Run only op-based tests that are supported**
+```yaml
+- names:
+    - TestBinaryUfuncs::test_scalar_support
+  selectors:
+    include:
+      - has_ops: true
+        ops_in_supported: true
+```
+
+**Scenario 2: Exclude slow tests**
+```yaml
+- names:
+    - TestBinaryUfuncs::test_contig_vs_transposed
+  selectors:
+    exclude:
+      - markers:
+          - slow
+      - name_patterns:
+          - "test_deprecated_*"
+```
+
+**Scenario 3: Run specific test patterns for a model**
+```yaml
+- names:
+    - TestModule::test_forward
+  selectors:
+    include:
+      - markers:
+          - model_resnet
+        name_patterns:
+          - "test_conv*"
+          - "test_batchnorm*"
+```
+
+**Scenario 4: Filter non-op tests when using global op list**
+```yaml
+- names:
+    - TestBinaryUfuncs::test_scalar_support
+  selectors:
+    exclude:
+      - has_ops: false  # Skip tests without @ops decorator
+```
 
 ---
 
@@ -503,17 +544,19 @@ Automatically filter out tests that don't have op-related decorators when a glob
 
 ### 7.3 Implementation Strategy
 
-Use `test_selectors` to declaratively filter non-op tests:
+Use `selectors` within a test entry to declaratively filter non-op tests:
 
 ```yaml
-test_selectors:
-  include:
-    - has_ops: true
-      ops_in_supported: true
-  
-  # Alternatively, exclude non-op tests explicitly:
-  exclude:
-    - has_ops: false
+- names:
+    - TestBinaryUfuncs::test_scalar_support
+  selectors:
+    include:
+      - has_ops: true
+        ops_in_supported: true
+    
+    # Alternatively, exclude non-op tests explicitly:
+    exclude:
+      - has_ops: false
 ```
 
 **Pytest integration:**
@@ -529,11 +572,13 @@ test_suite_config:
   files:
     - path: ${TORCH_ROOT}/test/**/*.py  # Glob pattern - collects everything
       unlisted_test_mode: skip
-  
-  test_selectors:
-    include:
-      - has_ops: true
-        ops_in_supported: true
+      tests:
+        - names:
+            - TestBinaryUfuncs::test_scalar_support
+          selectors:                    # ← per-test, not top-level
+            include:
+              - has_ops: true
+                ops_in_supported: true
   
   global:
     supported_ops:
@@ -548,8 +593,8 @@ test_suite_config:
 
 **Skip message:**
 ```
-SKIPPED [1] test_utils.py::test_utility_function: Test has no @ops decorator (filtered by test_selectors)
-SKIPPED [1] test_ops.py::test_gcd: Test ops ['gcd'] not in supported ops (filtered by test_selectors)
+SKIPPED [1] test_utils.py::test_utility_function: Test has no @ops decorator (filtered by selectors)
+SKIPPED [1] test_ops.py::test_gcd: Test ops ['gcd'] not in supported ops (filtered by selectors)
 ```
 
 ---
@@ -673,11 +718,13 @@ test_suite_config:
   files:
     - path: ${TORCH_ROOT}/test/**/*.py  # Collect all test files
       unlisted_test_mode: skip
-  
-  test_selectors:
-    include:
-      - has_ops: true
-        ops_in_supported: true
+      tests:
+        - names:
+            - TestBinaryUfuncs::test_scalar_support
+          selectors:                    # ← per-test selector
+            include:
+              - has_ops: true
+                ops_in_supported: true
   
   global:
     supported_ops:
@@ -703,6 +750,27 @@ global:
 
 Each test variant will run on both devices, enabling cross-device validation.
 
+### 8.8 Module include/exclude for a test *(New scenario)*
+
+`TestModule::test_forward` should run `BatchNorm2d` even though it is not in `global.supported_modules`, but must skip `Linear` due to OOM:
+
+```yaml
+- path: ${TORCH_ROOT}/test/test_modules.py
+  unlisted_test_mode: skip
+  tests:
+    - names:
+        - TestModule::test_forward
+      mode: mandatory_success
+      edits:
+        modules:
+          include:
+            - name: torch.nn.BatchNorm2d
+              description: "add batchnorm even though not in global.supported_modules"
+          exclude:
+            - name: torch.nn.Linear
+              description: "Linear causes OOM on this test"
+```
+
 ---
 
 ## 9. Field Reference Summary
@@ -722,17 +790,20 @@ Each test variant will run on both devices, enabling cross-device validation.
 | `names` | list of strings | Yes | — |
 | `mode` | enum | No | `mandatory_success` |
 | `tags` | list of strings | No | `[]` |
+| `selectors` | selector dict | No | — | ← **New** (moved from top-level) [Planned] |
 | `edits.ops.include` | list of `{name, description?}` | No | `[]` |
 | `edits.ops.exclude` | list of `{name, description?}` | No | `[]` |
+| `edits.modules.include` | list of `{name, description?}` | No | `[]` | ← **New** |
+| `edits.modules.exclude` | list of `{name, description?}` | No | `[]` | ← **New** |
 | `edits.dtypes.include` | list of `{name, description?}` | No | `[]` |
 | `edits.dtypes.exclude` | list of `{name, description?}` | No | `[]` |
 
-### Test Selectors *[Planned]*
+### ~~Test Selectors~~ *(removed from top-level — see `selectors` in Test entry above)*
 
-| Field | Type | Required | Default |
-|---|---|---|---|
-| `include` | list of selector dicts | No | `[]` |
-| `exclude` | list of selector dicts | No | `[]` |
+~~| Field | Type | Required | Default |~~
+~~|---|---|---|---|~~
+~~| `include` | list of selector dicts | No | `[]` |~~
+~~| `exclude` | list of selector dicts | No | `[]` |~~
 
 #### Selector Dict Fields
 
@@ -783,6 +854,8 @@ Each test variant will run on both devices, enabling cross-device validation.
 9. `devices` must be valid device type strings (e.g., `cpu`, `cuda`, `spyre`, `privateuse1`)
 10. Test selector patterns must be valid glob patterns
 11. Test selector marker names must be valid pytest marker names
+12. **[New]** `edits.modules.include` and `edits.modules.exclude` entries must have a `name` field that is a fully-qualified Python class path (e.g. `torch.nn.BatchNorm2d`)
+13. **[New]** `selectors` within a test entry follows the same validation rules as the former top-level `test_selectors`
 
 ---
 
@@ -865,8 +938,8 @@ python3 -m pytest test_binary_ufuncs.py -v -m model_name_depending_on_this_test_
 # Run tests matching a specific pattern
 python3 -m pytest test_binary_ufuncs.py -v -k "test_scalar_support"
 
-# [Planned] Use test selectors for complex filtering
-# This will be automatic based on test_selectors in config
+# [Planned] Use per-test selectors for complex filtering
+# This will be automatic based on selectors in each test entry
 ```
 
 #### Environment Variables Reference
@@ -895,13 +968,14 @@ The following features are documented in this RFC but not yet implemented:
 - Conditional device inclusion based on availability
 
 
-### 13.2 Test Selectors (§3.2)
+### 13.2 Test Selectors (§5.4)
 
-**Target:** Advanced declarative test filtering
+**Target:** Advanced declarative test filtering, scoped per test entry
 
 **Benefits:**
 - Filter by ops, markers, patterns, decorators
 - Include/exclude logic with OR/AND combinations
+- Different tests in the same file can use different selector logic
 - No test file modification needed
 
 
@@ -923,24 +997,8 @@ The following example demonstrates every supported field in a single config file
 ```yaml
 test_suite_config:
 
-  # ── Test Selectors [Planned] ──────────────────────────────────────────────
-  test_selectors:
-    include:
-      # OR between list items, AND within each dict
-      - has_ops: true
-        ops_in_supported: true
-      
-      - markers:
-          - model_resnet
-        name_patterns:
-          - "test_conv*"
-    
-    exclude:
-      - markers:
-          - slow
-          - requires_internet
-      
-      - has_ops: false  # Filter non-op tests
+  # NOTE: test_selectors has been removed from the top level.
+  # Test filtering is now declared per-test via the `selectors` field — see tests below.
 
   # ── File Entries ───────────────────────────────────────────────────────────
   files:
@@ -955,7 +1013,7 @@ test_suite_config:
 
       tests:
 
-        # ── Entry 1: two tests sharing the same mode, tags, and edits ────────
+        # ── Entry 1: two tests sharing the same mode, tags, selectors, and edits ──
         - names:
             - TestBinaryUfuncs::test_scalar_support
             - TestBinaryUfuncs::test_contig_vs_transposed
@@ -973,33 +1031,46 @@ test_suite_config:
             - model_1
             - model_2
 
+          # selectors: per-test filtering [Planned] — replaces former top-level test_selectors
+          # OR between list items, AND within each dict
+          selectors:
+            include:
+              - has_ops: true
+                ops_in_supported: true
+            exclude:
+              - markers:
+                  - slow
+                  - requires_internet
+              - has_ops: false
+
           edits:
 
             ops:
               # include: inject an op into @ops.op_list for these tests.
-              # Needed when the upstream test uses a filtered list
-              # (e.g. binary_ufuncs_with_references) that excludes the op,
-              # or the op is not in global.supported_ops but you want to
-              # test it for these tests only.
               include:
                 - name: add
                   description: "inject add — binary_ufuncs_with_references excludes it if ref is None"
 
               # exclude: remove an op from @ops.op_list for these tests only.
-              # Useful when op is in supported_ops globally but causes issues here.
               exclude:
                 - name: gcd
                   description: "gcd causes buffer alignment errors for this test"
 
+            # modules: NEW — inject or suppress modules for these tests
+            modules:
+              include:
+                - name: torch.nn.BatchNorm2d
+                  description: "add batchnorm even though not in global.supported_modules"
+              exclude:
+                - name: torch.nn.Linear
+                  description: "Linear causes OOM on this test"
+
             dtypes:
               # include: inject a dtype into @ops.allowed_dtypes for these tests.
-              # NOT required to be a subset of global.supported_dtypes —
-              # allows testing a new dtype on specific tests without enabling globally.
               include:
                 - name: float32   # not in global.supported_dtypes — injected for this test only
 
               # exclude: suppress a dtype variant for these tests only.
-              # Applied unconditionally — always wins over include and global.
               exclude:
                 - name: bfloat16
                   description: "bfloat16 unsupported on Spyre for this test"
@@ -1016,8 +1087,6 @@ test_suite_config:
       tests:
 
         # ── Entry: module-level test (no @ops, plain device arg) ─────────────
-        # No op filtering needed — test has no @ops decorator.
-        # Only dtype exclusion and mode apply.
         - names:
             - TestCommon::test_compare_cpu
           # export PYTORCH_TEST_WITH_SLOW=1 required for this test
@@ -1027,6 +1096,24 @@ test_suite_config:
               exclude:
                 - name: float32
                   description: "corrupted double-linked list — test_compare_cpu__refs__conversions_float_spyre_float32"
+
+    # ── File 3: upstream test_modules.py ─────────────────────────────────────
+    - path: ${TORCH_ROOT}/test/test_modules.py
+      unlisted_test_mode: skip
+      tests:
+
+        # ── Entry: module test with edits.modules ─────────────────────────────
+        - names:
+            - TestModule::test_forward
+          mode: mandatory_success
+          edits:
+            modules:
+              include:
+                - name: torch.nn.BatchNorm2d
+                  description: "add batchnorm even though not in global.supported_modules"
+              exclude:
+                - name: torch.nn.Linear
+                  description: "Linear causes OOM on this test"
 
   # ── Global: device-wide capability declaration ─────────────────────────────
   global:
@@ -1039,41 +1126,27 @@ test_suite_config:
       - cuda    # Optional: if available
 
     # supported_dtypes: positive list of dtypes the hardware supports.
-    # Hard ceiling for the base dtype set across all tests.
-    # Variants outside this list are skipped unless edits.dtypes.include overrides.
     supported_dtypes:
       - name: float16
       - name: int64
 
     # supported_ops: only ops listed here generate test variants.
-    # _SpyreOpListPatcher filters @ops.op_list to this set before test generation.
     supported_ops:
 
       - name: add
-        # force_xfail: flip mandatory_success → xfail at the variant level for this op.
-        # Does not affect xfail, xfail_strict, or skip variants.
         force_xfail: false
-
-        # dtypes: op-level dtype override. Must be subset of global.supported_dtypes.
-        # Each dtype can specify precision (atol/rtol) for tolerance-sensitive ops.
         dtypes:
           - name: float16
             precision:
               atol: 1e-3
               rtol: 1e-3
           - name: int64
-            # no precision override — uses framework default
 
       - name: mul
-        # no dtypes override → defaults to global.supported_dtypes [float16, int64]
-        # no force_xfail → defaults to false
 
       - name: sub
 
       - name: gcd
-        # force_xfail: true → all mandatory_success variants for gcd are flipped to xfail.
-        # Use when op is supported but not yet stable enough to require passing.
-        # Flip to false once gcd is stable.
         force_xfail: true
 ```
 
@@ -1085,6 +1158,7 @@ test_suite_config:
 - File-level configuration with glob patterns
 - Test-level mode and tag configuration
 - Op and dtype edits (include/exclude)
+- Module edits (include/exclude) via `edits.modules`
 - Global supported ops and dtypes
 - Force xfail at op level
 - Precision overrides per op/dtype
@@ -1092,8 +1166,8 @@ test_suite_config:
 ### Phase 2: Planned 
 - Global `devices` configuration (§6.1)
 - Non-op test filtering (§7)
-- Basic test selectors (§3.2) - `has_ops`, `ops_in_supported`
-- Advanced test selectors - markers, patterns
+- Per-test `selectors`
+- Advanced test selectors — markers, patterns
 - Per-test device overrides
 - Subprocess execution for test isolation
 - Configuration merge logic for layered configs
@@ -1137,14 +1211,16 @@ pytest test_binary_ufuncs.py -m "not model_1"
 ### Test selectors example (reference) *[Planned]*
 
 ```bash
-# Configured via YAML, executed automatically:
-test_selectors:
-  include:
-    - has_ops: true
-      ops_in_supported: true
-  exclude:
-    - markers:
-        - slow
+# Configured per test entry via `selectors`, executed automatically:
+# - names:
+#     - TestBinaryUfuncs::test_scalar_support
+#   selectors:
+#     include:
+#       - has_ops: true
+#         ops_in_supported: true
+#     exclude:
+#       - markers:
+#           - slow
 
 # No command-line flags needed — filtering is automatic
 pytest test_binary_ufuncs.py
