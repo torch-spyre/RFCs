@@ -23,6 +23,7 @@ This RFC defines a YAML-based configuration schema that allows an OOT device tea
 - Filter tests based on flexible criteria (ops, markers, patterns, etc.)
 - Allow the same framework to control, parameterise device specific custom tests
 - Express per-op and per-test tolerance overrides
+- Specify arbitrary input tensors and arguments for any test
 - Tag tests with model names and other metadata for traceability
 - Gradually expand test coverage as the device matures
 
@@ -51,7 +52,8 @@ The Spyre framework hooks into this mechanism via `SpyreTestBase` (which can eve
 3. Patches `@onlyOn` to allow the `spyre` device type (`_OOTOnlyOnPatcher`)
 4. Injects extra dtypes into `@ops.allowed_dtypes` (`_OOTDtypePatcher`)
 5. Applies skip, xfail, or mandatory_success to each generated variant
-6. Adds custom markers to tests for provenance.
+6. Adds custom markers to tests for provenance
+7. Injects custom input arguments at test call time
 
 ---
 
@@ -79,8 +81,6 @@ test_suite_config:
     supported_ops:
       - ...
 ```
-
-
 
 | Field | Required | Description |
 |---|---|---|
@@ -161,7 +161,7 @@ tests:
             description: "add description for ops (optional)"
         exclude:
           - name: gcd
-      modules:                          # ← NEW field
+      modules:
         include:
           - name: torch.nn.BatchNorm2d
             description: "add batchnorm even though not in global.supported_modules"
@@ -176,6 +176,20 @@ tests:
         exclude:
           - name: bfloat16
             description: "add description for dtypes exclude (optional)"
+      inputs:                           
+        args:
+          - tensor:
+              shape: [128, 128]
+              dtype: float16
+              device: spyre
+              init: rand
+          - tensor:
+              shape: [128, 128]
+              dtype: float16
+              device: spyre
+              init: rand
+        kwargs:
+          alpha: 1.0
 ```
 
 | Field | Required | Default | Description |
@@ -183,8 +197,8 @@ tests:
 | `names` | Yes | — | List of `ClassName::method_name` identifying the upstream test |
 | `mode` | No | `mandatory_success` | How to treat this test's variants |
 | `tags` | No | `[]` | Pytest mark labels applied to all variants of this test |
-| `selectors` | No | — | **[New, Planned]** Per-test filtering criteria. Replaces the former top-level `test_selectors`. Same schema — see §5.4 |
-| `edits` | No | — | Per-test overrides for ops, modules, and dtypes |
+| `selectors` | No | — | Per-test filtering criteria. Replaces the former top-level `test_selectors`. Same schema — see §5.4 |
+| `edits` | No | — | Per-test overrides for ops, modules, dtypes, and inputs |
 
 ### 5.1 Test `mode`
 
@@ -243,7 +257,7 @@ edits:
 
 Both `include` and `exclude` are lists of dicts with `name` and `description (optional)` field, kept consistent for future extensibility (e.g. adding per-op precision overrides at the test level).
 
-#### 5.3.2 `edits.modules` 
+#### 5.3.2 `edits.modules`
 
 Controls which modules are included in `@modules.module_list` for this specific test. Mirrors the structure of `edits.ops`.
 
@@ -291,8 +305,8 @@ The effective dtypes for a given test variant are computed as:
 ```
 effective_dtypes =
     (global.supported_dtypes ∩ op.dtypes ∩ test.allowed_dtypes)     <- base intersection
-    + edits.dtypes.include <- injected dtypes
-    - edits.dtypes.exclude                                          <- removed dtypes
+    + edits.dtypes.include                                           <- injected dtypes
+    - edits.dtypes.exclude                                           <- removed dtypes
 ```
 
 Where:
@@ -300,9 +314,105 @@ Where:
 - `global.supported_dtypes` — hardware capability.
 - `op.dtypes` — op-level dtype override from `global.supported_ops[op].dtypes`. If not specified, defaults to `global.supported_dtypes`.
 - `test.allowed_dtypes` — upstream `@ops(allowed_dtypes=(...))` constraint from the test source code.
-- `edits.dtypes.include` — can be mutually exclusive to `global.supported_dtypes`, not necessarily a subset. It can be an additional dtype to
-test for a particular op without affecting other tests.
+- `edits.dtypes.include` — can be mutually exclusive to `global.supported_dtypes`, not necessarily a subset. It can be an additional dtype to test for a particular op without affecting other tests.
 - `edits.dtypes.exclude` — applied last, after all inclusions.
+
+#### 5.3.4 `edits.inputs`
+
+Specifies the exact positional and keyword arguments passed to the test function (or module's `forward`) when it is invoked. This allows full control over tensor shapes, dtypes, strides, initialization strategies, and any scalar or Python-literal arguments.
+
+When `edits.inputs` is absent, the framework uses its default input generation logic unchanged.
+
+```yaml
+edits:
+  inputs:
+    args:
+      - tensor:
+          shape: [1, 11, 2880]
+          dtype: float16
+          device: spyre
+          init: rand
+      - tensor:
+          shape: [2880]
+          dtype: float16
+          device: spyre
+          init: rand
+          stride: [1]
+          storage_offset: 0
+      - tensor_list:
+          - shape: [1, 8, 11, 32]
+            dtype: float16
+            device: spyre
+            init: rand
+          - shape: [1, 8, 11, 32]
+            dtype: float16
+            device: spyre
+            init: rand
+      - value: null
+      - value: 2.0
+      - py: "(Ellipsis, slice(None, -1, None))"
+    kwargs:
+      dim: -1
+      keepdim: true
+      dtype: float16
+      training: false
+```
+
+##### `args` — positional arguments
+
+`args` is an ordered list. Each element is **exactly one** of four kinds:
+
+| Kind | Key | Description |
+|---|---|---|
+| Single tensor | `tensor` | A single tensor built from the tensor spec (see tensor fields below) |
+| List of tensors | `tensor_list` | A list of tensor specs. Used for ops that take a sequence of tensors as one positional argument (e.g. `torch.cat`, `torch.stack`) |
+| Python scalar / None | `value` | A YAML scalar rendered as a Python literal: numbers, `null`-> `None`, `true`/`false` → `True`/`False` |
+| Python expression | `py` | A string safely evaluated via `ast.literal_eval`. Use for slices, tuples, `Ellipsis`, and other non-scalar literals |
+
+##### Tensor spec fields
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `shape` | Yes | — | List of positive ints. Use `[]` for a scalar tensor |
+| `dtype` | Yes | — | PyTorch dtype string: `float16`, `float32`, `float64`, `bfloat16`, `int8`, `int16`, `int32`, `int64`, `uint8`, `bool`, `complex64`, `complex128` |
+| `device` | Yes | — | Device string: `spyre`, `cpu`, `cuda:0`, etc. |
+| `init` | Yes | — | Initialization strategy — see init strategies below |
+| `init_args` | No | — | Extra arguments for the init strategy |
+| `stride` | No | contiguous | Explicit strides as a list of ints, same length as `shape` |
+| `storage_offset` | No | `0` | Storage offset in number of elements |
+
+##### Init strategies
+
+| `init` | PyTorch call | Notes |
+|---|---|---|
+| `rand` | `torch.rand(shape, ...)` | Uniform [0, 1). Floating-point dtypes only |
+| `randn` | `torch.randn(shape, ...)` | Standard normal. Floating-point dtypes only |
+| `zeros` | `torch.zeros(shape, ...)` | All zeros |
+| `ones` | `torch.ones(shape, ...)` | All ones |
+| `randint` | `torch.randint(low, high, shape, ...)` | Requires `init_args.high`. `init_args.low` defaults to `0` |
+| `arange` | `torch.arange(shape[0], ...)` | Shape must be 1-D |
+| `eye` | `torch.eye(shape[0], ...)` | Shape must be 2-D with equal dimensions |
+| `full` | `torch.full(shape, fill_value, ...)` | Requires `init_args.fill_value` |
+| `file` | `torch.load(path)` or format-equivalent | Load tensor from disk. Requires `init_args.path`. Supported: `.pt`, `.npy`, `.safetensors` |
+
+`init_args` sub-fields:
+
+```yaml
+init_args:
+  low: 0                            # randint only -- lower bound (default 0)
+  high: 1000                        # randint only -- upper bound (required)
+  fill_value: 3.14                  # full only -- scalar fill value (required)
+  path: /path/to/tensor.pt          # file only -- path to tensor file (required)
+  key: weight                       # file only -- key within file (optional, for safetensors / dict-based .pt)
+```
+
+##### `kwargs` — keyword arguments
+
+Flat key-value mapping. String values matching a known PyTorch dtype name (`float16`, `bfloat16`, `float32`, etc.) are resolved to the corresponding `torch.*` dtype object at runtime. `null` → `None`, `true`/`false` → `True`/`False`, numbers pass through as-is.
+
+##### Interaction with `@ops` dtype parametrization
+
+For `@ops`-decorated tests, the framework generates one variant per `(op, dtype)` combination. When `edits.inputs` is present, the shape, layout, and init strategy come from the spec. If a tensor spec's `dtype` does not match the variant's active dtype, a warning is emitted and the variant dtype takes precedence (the tensor is cast before the test runs). For module tests and plain non-`@ops` tests, the tensor spec dtype is used as-is.
 
 ### 5.4 Test Selectors *[Planned]*
 
@@ -469,7 +579,7 @@ global:
 
 ### 6.2 `supported_dtypes`
 
-The complete set of dtypes the device hardware supports. No test variant will run with a dtype outside this list will run, unless in the test specific config, it is explicitly set to include.
+The complete set of dtypes the device hardware supports. No test variant will run with a dtype outside this list, unless in the test specific config, it is explicitly set to include.
 
 If omitted, no dtype filtering is applied at the global level.
 
@@ -750,7 +860,7 @@ global:
 
 Each test variant will run on both devices, enabling cross-device validation.
 
-### 8.8 Module include/exclude for a test *(New scenario)*
+### 8.8 Module include/exclude for a test
 
 `TestModule::test_forward` should run `BatchNorm2d` even though it is not in `global.supported_modules`, but must skip `Linear` due to OOM:
 
@@ -769,6 +879,216 @@ Each test variant will run on both devices, enabling cross-device validation.
           exclude:
             - name: torch.nn.Linear
               description: "Linear causes OOM on this test"
+```
+
+### 8.9 Custom input tensors for a module test
+
+`TestModule::test_forward` for `BatchNorm2d` requires a 4-D NCHW input. The default framework input generator may not produce the right shape:
+
+```yaml
+- path: ${TORCH_ROOT}/test/test_modules.py
+  unlisted_test_mode: skip
+  tests:
+    - names:
+        - TestModule::test_forward
+      mode: mandatory_success
+      edits:
+        modules:
+          include:
+            - name: torch.nn.BatchNorm2d
+        inputs:
+          args:
+            - tensor:
+                shape: [4, 16, 32, 32]   # NCHW: batch=4, C=16, H=32, W=32
+                dtype: float16
+                device: spyre
+                init: rand
+          kwargs:
+            training: false
+```
+
+### 8.10 Non-contiguous layout
+
+Stress the transpose code path with a column-major tensor:
+
+```yaml
+- names:
+    - TestBinaryUfuncs::test_contig_vs_transposed
+  mode: mandatory_success
+  edits:
+    inputs:
+      args:
+        - tensor:
+            shape: [64, 64]
+            dtype: float16
+            device: spyre
+            init: randn
+            stride: [1, 64]       # column-major layout
+        - tensor:
+            shape: [64, 64]
+            dtype: float16
+            device: spyre
+            init: randn
+```
+
+### 8.11 Mixed tensors, scalars, and None
+
+Matching the call signature of `torch.nn.functional.embedding`:
+
+```python
+# Python
+output = torch.nn.functional.embedding(
+    input,           # shape [1, 11], int64
+    weight,          # shape [201088, 2880], float16
+    padding_idx=199999,
+    max_norm=None,
+    norm_type=2.0,
+    scale_grad_by_freq=False,
+    sparse=False,
+)
+```
+
+```yaml
+- names:
+    - TestNN::test_embedding
+  mode: mandatory_success
+  edits:
+    inputs:
+      args:
+        - tensor:
+            shape: [1, 11]
+            dtype: int64
+            device: spyre
+            init: randint
+            init_args:
+              high: 1000
+        - tensor:
+            shape: [201088, 2880]
+            dtype: float16
+            device: spyre
+            init: rand
+        - value: 199999      # padding_idx
+        - value: null        # max_norm
+        - value: 2.0         # norm_type
+        - value: false       # scale_grad_by_freq
+        - value: false       # sparse
+```
+
+### 8.12 Tensor list argument
+
+Testing `torch.cat` which takes a sequence of tensors as its first positional argument:
+
+```python
+# Python
+output = torch.cat(
+    [tensor_a,   # shape [1, 8, 11, 32], float16
+     tensor_b],  # shape [1, 8, 11, 32], float16
+    dim=-1,
+)
+```
+
+```yaml
+- names:
+    - TestBinaryUfuncs::test_cat
+  mode: mandatory_success
+  edits:
+    inputs:
+      args:
+        - tensor_list:
+            - shape: [1, 8, 11, 32]
+              dtype: float16
+              device: spyre
+              init: rand
+            - shape: [1, 8, 11, 32]
+              dtype: float16
+              device: spyre
+              init: rand
+      kwargs:
+        dim: -1
+```
+
+### 8.13 Slice / Ellipsis index argument
+
+```python
+# Python
+output = tensor[..., :-1]   # tensor shape [1, 64, 11, 129], float16
+```
+
+```yaml
+- names:
+    - TestViewOps::test_getitem_slice
+  mode: mandatory_success
+  edits:
+    inputs:
+      args:
+        - tensor:
+            shape: [1, 64, 11, 129]
+            dtype: float16
+            device: spyre
+            init: rand
+        - py: "(Ellipsis, slice(None, -1, None))"
+```
+
+### 8.14 Large matmul shapes from model tracing
+
+Pin inputs to shapes observed in a GPT model trace:
+
+```python
+# Python
+output = torch.bmm(
+    input,   # shape [44, 1, 2880], float16
+    mat2,    # shape [44, 2880, 5760], float16
+)
+# output shape [44, 1, 5760]
+```
+
+```yaml
+- names:
+    - TestLinalg::test_bmm
+  mode: mandatory_success
+  tags:
+    - gpt_oss_20b
+  edits:
+    inputs:
+      args:
+        - tensor:
+            shape: [44, 1, 2880]
+            dtype: float16
+            device: spyre
+            init: rand
+        - tensor:
+            shape: [44, 2880, 5760]
+            dtype: float16
+            device: spyre
+            init: rand
+```
+
+### 8.15 Load tensor from file
+
+Use a weight matrix captured during model tracing as exact input, avoiding any synthetic approximation:
+
+```yaml
+- names:
+    - TestLinalg::test_mm
+  mode: mandatory_success
+  edits:
+    inputs:
+      args:
+        - tensor:
+            shape: [1, 11, 2880]
+            dtype: float16
+            device: spyre
+            init: file
+            init_args:
+              path: ${TORCH_DEVICE_ROOT}/tests/fixtures/hidden_states.pt
+        - tensor:
+            shape: [4096, 2880]
+            dtype: float16
+            device: spyre
+            init: file
+            init_args:
+              path: ${TORCH_DEVICE_ROOT}/tests/fixtures/model.safetensors
+              key: model.layers.0.self_attn.q_proj.weight
 ```
 
 ---
@@ -790,20 +1110,57 @@ Each test variant will run on both devices, enabling cross-device validation.
 | `names` | list of strings | Yes | — |
 | `mode` | enum | No | `mandatory_success` |
 | `tags` | list of strings | No | `[]` |
-| `selectors` | selector dict | No | — | ← **New** (moved from top-level) [Planned] |
+| `selectors` | selector dict | No | — | [Planned] |
 | `edits.ops.include` | list of `{name, description?}` | No | `[]` |
 | `edits.ops.exclude` | list of `{name, description?}` | No | `[]` |
-| `edits.modules.include` | list of `{name, description?}` | No | `[]` | ← **New** |
-| `edits.modules.exclude` | list of `{name, description?}` | No | `[]` | ← **New** |
+| `edits.modules.include` | list of `{name, description?}` | No | `[]` |
+| `edits.modules.exclude` | list of `{name, description?}` | No | `[]` |
 | `edits.dtypes.include` | list of `{name, description?}` | No | `[]` |
 | `edits.dtypes.exclude` | list of `{name, description?}` | No | `[]` |
+| `edits.inputs.args` | list of arg specs | No |
+| `edits.inputs.kwargs` | dict | No | `{}` |
 
-### ~~Test Selectors~~ *(removed from top-level — see `selectors` in Test entry above)*
+### Arg spec (one element of `edits.inputs.args`)
 
-~~| Field | Type | Required | Default |~~
-~~|---|---|---|---|~~
-~~| `include` | list of selector dicts | No | `[]` |~~
-~~| `exclude` | list of selector dicts | No | `[]` |~~
+Exactly one key per element:
+
+| Key | Value type | Description |
+|---|---|---|
+| `tensor` | tensor spec dict | Single tensor |
+| `tensor_list` | list of tensor spec dicts | Sequence of tensors as one positional arg |
+| `value` | YAML scalar | Number, `null`, `true`, `false` |
+| `py` | string | Python literal evaluated via `ast.literal_eval` |
+
+### Tensor spec
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `shape` | list of int | Yes | — |
+| `dtype` | string | Yes | — |
+| `device` | string | Yes | — |
+| `init` | enum | Yes | — |
+| `init_args.low` | int | No | `0` |
+| `init_args.high` | int | No (required for `randint`) | — |
+| `init_args.fill_value` | number | No (required for `full`) | — |
+| `init_args.path` | string | No (required for `file`) | — |
+| `init_args.key` | string | No (optional for `file`) | — |
+| `stride` | list of int | No | contiguous |
+| `storage_offset` | int | No | `0` |
+
+### Init strategies
+
+| Value | PyTorch equivalent |
+|---|---|
+| `rand` | `torch.rand` |
+| `randn` | `torch.randn` |
+| `zeros` | `torch.zeros` |
+| `ones` | `torch.ones` |
+| `randint` | `torch.randint` |
+| `arange` | `torch.arange` |
+| `eye` | `torch.eye` |
+| `full` | `torch.full` |
+| `file` | `torch.load` / `numpy.load` / `safetensors.load` |
+
 
 #### Selector Dict Fields
 
@@ -854,8 +1211,24 @@ Each test variant will run on both devices, enabling cross-device validation.
 9. `devices` must be valid device type strings (e.g., `cpu`, `cuda`, `spyre`, `privateuse1`)
 10. Test selector patterns must be valid glob patterns
 11. Test selector marker names must be valid pytest marker names
-12. **[New]** `edits.modules.include` and `edits.modules.exclude` entries must have a `name` field that is a fully-qualified Python class path (e.g. `torch.nn.BatchNorm2d`)
-13. **[New]** `selectors` within a test entry follows the same validation rules as the former top-level `test_selectors`
+12. `edits.modules.include` and `edits.modules.exclude` entries must have a `name` field that is a fully-qualified Python class path (e.g. `torch.nn.BatchNorm2d`)
+13. `selectors` within a test entry follows the same validation rules as the former top-level `test_selectors`
+14. Each element of `edits.inputs.args` must contain exactly one of: `tensor`, `tensor_list`, `value`, `py`
+15. `tensor.shape` must be a non-empty list of positive integers (`[]` allowed for scalar tensors)
+16. `tensor.dtype` must be a valid PyTorch dtype name
+17. `tensor.device` must be a valid device string
+18. `tensor.init` must be one of the nine supported strategies
+19. `tensor.init_args.high` is required when `init: randint`
+20. `tensor.init_args.fill_value` is required when `init: full`
+21. `tensor.init_args.path` is required when `init: file`. Must resolve to an existing file with a supported extension (`.  pt`, `.npy`, `.safetensors`)
+22. `tensor.init_args.key` is optional when `init: file`. Required when the `.pt` file contains a `dict` or the `.safetensors` file holds multiple tensors and no default can be inferred
+23. `tensor.stride`, if specified, must be a list of ints with the same length as `tensor.shape`
+24. `tensor.storage_offset`, if specified, must be a non-negative integer
+25. `py` values must be parseable by `ast.literal_eval`; arbitrary code execution is not permitted
+26. `arange` init requires a 1-D shape
+27. `eye` init requires a 2-D shape with equal dimensions
+28. When `init: file`, `tensor.shape` and `tensor.dtype` must match the loaded tensor exactly; mismatch raises a validation error at config load time
+29. If `tensor.dtype` does not match the active variant dtype for an `@ops`-parametrized test, a warning is emitted and the variant dtype takes precedence
 
 ---
 
@@ -878,7 +1251,7 @@ Each test variant will run on both devices, enabling cross-device validation.
 
 The orchestrator script resides in torch-spyre/tests/
 
-- Please login to your spyre-enabled pod and `cd` to the `torch-spyre` directory (provide relative/absolute path based on your current path in the pod, in that case provide paths accordingly) 
+- Please login to your spyre-enabled pod and `cd` to the `torch-spyre` directory (provide relative/absolute path based on your current path in the pod, in that case provide paths accordingly)
 
 Command format: `bash /path/to/torch-spyre/tests/run_test.sh /path/to/tests/config`
 
@@ -967,7 +1340,6 @@ The following features are documented in this RFC but not yet implemented:
 - Compare CPU vs custom device results
 - Conditional device inclusion based on availability
 
-
 ### 13.2 Test Selectors (§5.4)
 
 **Target:** Advanced declarative test filtering, scoped per test entry
@@ -977,7 +1349,6 @@ The following features are documented in this RFC but not yet implemented:
 - Include/exclude logic with OR/AND combinations
 - Different tests in the same file can use different selector logic
 - No test file modification needed
-
 
 ### 13.3 Non-Op Test Filtering (§7)
 
@@ -1013,26 +1384,18 @@ test_suite_config:
 
       tests:
 
-        # ── Entry 1: two tests sharing the same mode, tags, selectors, and edits ──
+        # ── Entry 1: two tests sharing mode, tags, selectors, edits, and inputs ──
         - names:
             - TestBinaryUfuncs::test_scalar_support
             - TestBinaryUfuncs::test_contig_vs_transposed
 
-          # mode applies to every (op × dtype) variant of all tests in names.
-          # Default when absent: mandatory_success
-          # Options: mandatory_success | xfail | xfail_strict | skip
           mode: xfail
 
-          # tags become pytest marks on every variant.
-          # Select with: pytest -m model_1
-          #              pytest -m "model_1 or model_2"
-          #              pytest -m "not model_1"
           tags:
             - model_1
             - model_2
 
-          # selectors: per-test filtering [Planned] — replaces former top-level test_selectors
-          # OR between list items, AND within each dict
+          # selectors: per-test filtering [Planned]
           selectors:
             include:
               - has_ops: true
@@ -1046,17 +1409,13 @@ test_suite_config:
           edits:
 
             ops:
-              # include: inject an op into @ops.op_list for these tests.
               include:
                 - name: add
                   description: "inject add — binary_ufuncs_with_references excludes it if ref is None"
-
-              # exclude: remove an op from @ops.op_list for these tests only.
               exclude:
                 - name: gcd
                   description: "gcd causes buffer alignment errors for this test"
 
-            # modules: NEW — inject or suppress modules for these tests
             modules:
               include:
                 - name: torch.nn.BatchNorm2d
@@ -1066,16 +1425,87 @@ test_suite_config:
                   description: "Linear causes OOM on this test"
 
             dtypes:
-              # include: inject a dtype into @ops.allowed_dtypes for these tests.
               include:
-                - name: float32   # not in global.supported_dtypes — injected for this test only
-
-              # exclude: suppress a dtype variant for these tests only.
+                - name: float32
               exclude:
                 - name: bfloat16
                   description: "bfloat16 unsupported on Spyre for this test"
 
-        # ── Entry 2: single test, mode skip ────
+            # ── inputs: specify exact positional and keyword arguments ──
+            inputs:
+              args:
+                # Single tensor with default contiguous layout
+                - tensor:
+                    shape: [128, 128]
+                    dtype: float16
+                    device: spyre
+                    init: rand
+
+                # Tensor with explicit non-contiguous (column-major) layout
+                - tensor:
+                    shape: [128, 128]
+                    dtype: float16
+                    device: spyre
+                    init: randn
+                    stride: [1, 128]
+                    storage_offset: 0
+
+                # Sequence of tensors as one positional arg (e.g. torch.cat)
+                - tensor_list:
+                    - shape: [1, 8, 11, 32]
+                      dtype: float16
+                      device: spyre
+                      init: rand
+                    - shape: [1, 8, 11, 32]
+                      dtype: float16
+                      device: spyre
+                      init: rand
+
+                # Scalar argument
+                - value: 1.0
+
+                # None argument
+                - value: null
+
+                # Python literal expression (slice, tuple, Ellipsis)
+                - py: "(Ellipsis, slice(None, -1, None))"
+
+                # randint tensor with explicit bounds
+                - tensor:
+                    shape: [11]
+                    dtype: int64
+                    device: spyre
+                    init: randint
+                    init_args:
+                      low: 0
+                      high: 128
+
+                # Tensor loaded from a .pt file
+                - tensor:
+                    shape: [201088, 2880]
+                    dtype: float16
+                    device: spyre
+                    init: file
+                    init_args:
+                      path: ${TORCH_DEVICE_ROOT}/tests/fixtures/embed_weight.pt
+
+                # Tensor loaded from a safetensors checkpoint by key
+                - tensor:
+                    shape: [4096, 2880]
+                    dtype: float16
+                    device: spyre
+                    init: file
+                    init_args:
+                      path: ${TORCH_DEVICE_ROOT}/tests/fixtures/model.safetensors
+                      key: model.layers.0.self_attn.q_proj.weight
+
+              kwargs:
+                dim: -1
+                keepdim: true
+                dtype: float16       # resolved to torch.float16
+                training: false
+
+        # ── Entry 2: single test, mode skip ─────────────────────────────────
         - names:
             - TestBinaryUfuncs::test_add
           mode: skip
@@ -1085,8 +1515,6 @@ test_suite_config:
     - path: ${TORCH_ROOT}/test/test_ops.py
       unlisted_test_mode: skip
       tests:
-
-        # ── Entry: module-level test (no @ops, plain device arg) ─────────────
         - names:
             - TestCommon::test_compare_cpu
           # export PYTORCH_TEST_WITH_SLOW=1 required for this test
@@ -1101,8 +1529,7 @@ test_suite_config:
     - path: ${TORCH_ROOT}/test/test_modules.py
       unlisted_test_mode: skip
       tests:
-
-        # ── Entry: module test with edits.modules ─────────────────────────────
+          # ── Entry: module test with edits.modules ────
         - names:
             - TestModule::test_forward
           mode: mandatory_success
@@ -1114,6 +1541,15 @@ test_suite_config:
               exclude:
                 - name: torch.nn.Linear
                   description: "Linear causes OOM on this test"
+            inputs:
+              args:
+                - tensor:
+                    shape: [4, 16, 32, 32]   # NCHW for BatchNorm2d
+                    dtype: float16
+                    device: spyre
+                    init: rand
+              kwargs:
+                training: false
 
   # ── Global: device-wide capability declaration ─────────────────────────────
   global:
@@ -1163,7 +1599,17 @@ test_suite_config:
 - Force xfail at op level
 - Precision overrides per op/dtype
 
-### Phase 2: Planned 
+### Phase 2: Current (In progress)
+  - Per-test input argument specification via `edits.inputs`
+  - Single tensors with shape, dtype, device, init strategy, stride, storage_offset
+  - Tensor lists for ops that take a sequence of tensors
+  - Scalar and None arguments via `value`
+  - Python literal expressions (slices, tuples, Ellipsis) via `py`
+  - File-based tensor loading (`.pt`, `.npy`, `.safetensors`) via `init: file`
+  - Keyword arguments via `kwargs`
+  - Automatic dtype resolution for kwarg dtype strings
+
+### Phase 3: Planned
 - Global `devices` configuration (§6.1)
 - Non-op test filtering (§7)
 - Per-test `selectors`
@@ -1178,9 +1624,9 @@ test_suite_config:
 
 ```
 effective_dtypes =
-    (global.supported_dtypes ∩ op.dtypes ∩ test.allowed_dtypes)  ← base
-    + edits.dtypes.include                                         ← additive, no global ceiling
-    - edits.dtypes.exclude                                         ← always applied last
+    (global.supported_dtypes ∩ op.dtypes ∩ test.allowed_dtypes)    <- base
+    + edits.dtypes.include                                         <- additive, no global ceiling
+    - edits.dtypes.exclude                                         <- always applied last
 ```
 
 ### Mode precedence (reference)
