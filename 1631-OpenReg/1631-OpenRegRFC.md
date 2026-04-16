@@ -7,4 +7,4 @@
 This RFC provides a comprehensive schematic covering various threads in PyTorch uptream and within IBM for privateUse1 and testing in the context of torch-spyre.
 
 ## **Schematic**
-![](./State_of_OpenReg_and_IBM.pdf)
+[Link to the schematic](./State_of_OpenReg_and_IBM.pdf)
