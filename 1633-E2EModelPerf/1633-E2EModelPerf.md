@@ -37,7 +37,7 @@ Op-level tests catch per-op drift, but only end-to-end comparison catches issues
 - Integrate into CI with pass/fail based on output match and tolerance thresholds
 - Optionally, we can cache the results of `HFRunner` instead of running it every time
 
-The tests will reside inside `vllm-spyre` repository and will be managed via GHA.
+The tests will reside inside `spyre-inference` repository and will be managed via GHA.
 
 ### Benchmarking
 
@@ -62,7 +62,7 @@ Without baselines, performance regressions are invisible until users report them
 - A central dashboard reporting the benchmarking numbers
 - vLLM bench does not support memory resource tracking as of now, we will have to contribute upstream to enable this
 
-The tests will reside inside `vllm-spyre` repository and will be managed via GHA.
+The tests will reside inside `spyre-inference` repository and will be managed via GHA.
 
 ### Quality Evals
 
@@ -93,16 +93,16 @@ Using an existing open source framework would ensure that we inherit the best pr
 - CI/CD pipelines for running these tests periodically
 - Infra for saving results and a dashboard for reporting metrics and regression
 
-The tests will reside inside `vllm-spyre` repository and will be managed via GHA.
+The tests will reside inside `spyre-inference` repository and will be managed via GHA.
 
 ## Current stack approach
 
-- **PELE**: Deploys vLLM-Spyre on Spyre hardware via K8s, sends prompts over HTTP (standard OpenAI API), compares Spyre outputs against committed GPU baselines using PeleScore (60% semantic + 30% grammar + 10% exact match). Covers ~5 models at 1K-32K context lengths. Covers both correctness and quality evals.
+- **PELE**: Deploys spyre-inference on Spyre hardware via K8s, sends prompts over HTTP (standard OpenAI API), compares Spyre outputs against committed GPU baselines using PeleScore (60% semantic + 30% grammar + 10% exact match). Covers ~5 models at 1K-32K context lengths. Covers both correctness and quality evals.
 - **zspyre-test-framework**: This framework supports benchmarking tests for encoder and decoder models in addition to correctness tests.
 - **fmwork**: Wrapper over vllm bench to run benchmarking tests.
 - **OLMES**: Qualtiy evals for multiple different scenarios, including: needle in the haystack, ruler, GSM8K, long cotenxt.
 - **BFCL**: Quality evals for tool calling use case. Based on open source datasets
-- **WXA4Z**: Wuality evals for agentic use case. Based on internal data (?).
+- **WXA4Z**: Quality evals for agentic use case. Based on internal data (?).
 
 ## Conclusion
 
