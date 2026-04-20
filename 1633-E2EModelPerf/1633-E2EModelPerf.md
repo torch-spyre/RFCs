@@ -77,7 +77,7 @@ A natural question is whether we should also run quality benchmarks (GSM8K, MMLU
 
 There is an explicit reason to do quality evals, if and only if, correctness check has a noticeable degradation. In that case, we would have no way to judge if the output from Spyre is indeed correct or not.
 
-Apart from this, we may need to perform use-case specific evals.
+Apart from this, we may need to perform use-case specific evals, where we may be testing specific prompts, agents with tool calls, document retrieval, etc., when the use case is being delivered on Spyre. Use case specific evals should not devolve down to testing a model on a known data set, which can be reproduced with upstream tests.
 
 **What upstream vLLM already provides:**
 
