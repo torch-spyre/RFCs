@@ -4,7 +4,12 @@
 * @kmehant
 
 ## **Summary**
-This RFC provides a comprehensive schematic covering various threads in PyTorch uptream and within IBM for privateUse1 and testing in the context of torch-spyre.
+This RFC provides a comprehensive schematics covering
+1. various threads in PyTorch uptream and within IBM for privateUse1 and testing in the context of torch-spyre.
+2. contribution to upstream.
 
-## **Schematic**
+## **Landscape Schematic**
 [Link to the schematic](./State_of_OpenReg_and_IBM.pdf)
+
+## **Contribution Schematic**
+[Link to the schematic](./Contribution.pdf)
