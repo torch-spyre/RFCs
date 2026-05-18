@@ -12,20 +12,14 @@ Such validation engines can be plugged into torch-spyre, maintained separately o
 
 We list below two main approaches for SDSC validation.
 
-## SDSC Schema and Pythonic class generation.
+## SDSC Schema
 
-Currently torch-spyre only contains `SDSCSpec` as a pythonic dataclass which is an input to the SuperDSC generation function while the actual SuperDSC JSON inside the `generate_sdsc` function is constructed separately. This is both cumbersome to maintain and harder to test because individual subparts of the SDSC have to be extracted from the captured JSON and not present as pythonic(pydantic or dataclass) classes which can be easily mocked for generating tests.
-We want to propose use of `SDSCSpec` (or additional dataclasses) which form a pythonic representation for the entire SuperDSC JSON to generate the final SDSC/SDSC Bundle.
+As one of the checks, we have built a schema for the SuperDSC JSON which conforms to the SDSC JSON being accepted by the backend compiler and has added that along with the RFC [here](./sdsc_schema.json).
 
-To move towards a pythonic view of the SuperDSC JSON we extracted a schema for the SuperDSC JSON which conforms to the SDSC JSON being accepted by the backend compiler and it's present [here](./sdsc_schema.json).
+Our goal with coming up with the schema mainly is to ensure the schema is regularly maintained as a contract between the frontend and backend compiler.
+Maintaining such a schema which is a single source of truth as the syntactic interface between torch-spyre and the backend compiler will allow us to pinpoint any difference between superdsc creation and acceptance in the frontend and backend compilers. 
 
-Our goal with coming up with the schema mainly is to, 
-- Ensure the schema is regularly maintained as a contract between the frontend and backend compiler.
-    - Maintaining such a schema which is a single source of truth as the syntactic interface between torch-spyre and the backend compiler will allow us to pinpoint any difference between superdsc creation and acceptance in the frontend and backend compilers. 
-- Propose torch-spyre to ensure we have pythonic classes for SuperDSC JSON based on the generated schema.
-    - This will help us with the [compilation stage wise testing](./002-rfc-torch-spyre-compilation-stage-wise-testing.md) as pythonic objects will be easy to create by hand or mock.
-
-We plan to expand this schema to include all features required by the backend compiler as part of the pythonic object generation.
+We plan to expand this schema to include all features required by the backend compiler.
 
 ---
 
