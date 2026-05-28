@@ -194,7 +194,7 @@ tests:
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `names` | Yes | — | List of `ClassName::method_name` identifying the upstream test |
+| `names` | Yes | — | List of `ClassName::method_name` identifying the upstream test. Supports regex patterns in the method name part, matched via `re.fullmatch` against the full instantiated method name. Since parametrized tests have suffixes appended (e.g. `test_sqrt_1d_abs_spyre`), patterns must end with `.*` unless targeting a standalone non-parametrized test. Examples: `TestOps::test_rope_fms_.*`, `TestOps::test_(sqrt|rsqrt|log).*` |
 | `mode` | No | `mandatory_success` | How to treat this test's variants |
 | `tags` | No | `[]` | Pytest mark labels applied to all variants of this test |
 | `selectors` | No | — | Per-test filtering criteria. Replaces the former top-level `test_selectors`. Same schema — see §5.4 |
@@ -1159,7 +1159,7 @@ Use a weight matrix captured during model tracing as exact input, avoiding any s
 
 | Field | Type | Required | Default |
 |---|---|---|---|
-| `names` | list of strings | Yes | — |
+| `names` | list of strings | Yes | — | Each string is `ClassName::method_name`; the method name part supports regex patterns matched via `re.fullmatch` at collection time. Parametrized test patterns must end with `.*` |
 | `mode` | enum | No | `mandatory_success` |
 | `tags` | list of strings | No | `[]` |
 | `selectors` | selector dict | No | — | [Planned] |
@@ -1252,7 +1252,7 @@ Exactly one key per element:
 
 ## 10. Validation Rules
 
-1. `names` must match `ClassName::method_name` pattern
+1. `names` must match `ClassName::method_name` pattern. The method name part may contain regex metacharacters; patterns are matched using `re.fullmatch` against the full instantiated test name at collection time. Since parametrized tests have suffixes appended by the PARAMS system (e.g. `test_sqrt_1d_abs_spyre`), patterns targeting parametrized tests **must end with `.*`**. Patterns without `.*` only match standalone non-parametrized tests whose name has no suffix (e.g. `test_bool`, `test_matmul_tiled_y`). Examples: `TestOps::test_rope_fms_.*` matches all rope fms variants; `TestOps::test_(sqrt|rsqrt|log).*` matches all sqrt, rsqrt, and log variants; `TestOps::test_bool` matches only the exact standalone test.
 2. `mode` and `unlisted_test_mode` must be one of `mandatory_success`, `xfail`, `xfail_strict`, `skip`
 3. All dtype strings must be valid PyTorch dtype names
 4. `edits.dtypes.include` may be subset of `global.supported_dtypes` or mutually exclusive to `global.supported_dtypes`
@@ -1466,6 +1466,8 @@ test_suite_config:
         - names:
             - TestBinaryUfuncs::test_scalar_support
             - TestBinaryUfuncs::test_contig_vs_transposed
+            - TestBinaryUfuncs::test_scalar_*
+            - TestBinaryUfuncs::test_(add|mul).* # regex: matches test_add_* and test_mul_* variants
 
           mode: xfail
 
