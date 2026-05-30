@@ -6,11 +6,12 @@
 * @tardieu
 
 
-A conceptual companion to the reference document [coarse_tiling_loops.md](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/compiler/coarse_tiling_loops.md). The reference doc
-describes *what* each attribute is and *how* the layers wire together —
-optimized for the implementer who needs the contract. This doc
-describes *why the design has the shape it does*: what problem it
-solves, and what choices fall out from that.
+A conceptual companion to the reference document
+[coarse_tiling_loops.md](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/compiler/coarse_tiling_loops.md).
+The reference doc describes *what* each attribute is and *how* the layers
+wire together — optimized for the implementer who needs the
+contract. This doc describes *why the design has the shape it does*:
+what problem it solves, and what choices fall out from that.
 
 > **Status:** living document.
 
@@ -296,20 +297,20 @@ inserted a copy would handle all three correctly but waste HBM in Case
 
 Once the loop has reached `LoopSpec` form at Layer 3, one question
 remains: who unrolls it — the frontend, or something downstream? This
-is gated by `config.bundle_hbm_symbols`.
+is gated by `config.unroll_loops`.
 
-When `use_symbols=False` (today's default), the frontend unrolls.
+When `unroll_loops=True` (today's default), the frontend unrolls.
 Each `LoopSpec(K, body)` becomes K body copies — addresses advanced by
 `iter * stride`, `device_size` set to per-tile shape, `tiled_symbols`
 cleared. The bundle.mlir ends up with K plain `sdsc_execute` calls,
 addresses baked into each `sdsc_*.json`.
 
-When `use_symbols=True`, the frontend defers. Bundle.mlir keeps the
+When `unroll_loops=False`, the frontend defers. Bundle.mlir keeps the
 loop intact — an `scf.for` block wrapping `affine.apply` per tiled
 tensor, then `sdsc_execute`. A downstream stage evaluates the address
 arithmetic per iteration.
 
-`use_symbols=True` is strictly more capable (smaller bundle, symbolic
+`unroll_loops=False` is strictly more capable (smaller bundle, symbolic
 K, late-bound input addresses), but the backend doesn't yet fully
 support the symbol-table machinery it requires, so it's opt-in.
 
