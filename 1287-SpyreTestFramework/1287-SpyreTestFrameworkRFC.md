@@ -50,10 +50,45 @@ The Spyre framework hooks into this mechanism via `SpyreTestBase` (which can eve
 1. Loads the YAML config on first `instantiate_test` call
 2. Patches `@ops.op_list` directly to restrict which ops generate variants (`_OOTOpListPatcher`)
 3. Patches `@onlyOn` to allow the `spyre` device type (`_OOTOnlyOnPatcher`)
-4. Injects extra dtypes into `@ops.allowed_dtypes` (`_OOTDtypePatcher`)
-5. Applies skip, xfail, or mandatory_success to each generated variant
-6. Adds custom markers to tests for provenance
-7. Injects custom input arguments at test call time
+4. Patches `@onlyNativeDeviceTypes` and `@onlyNativeDeviceTypesAnd` to include
+   `"privateuse1"` in `NATIVE_DEVICES` (`_OOTNativeDeviceTypesPatcher`)
+5. Injects extra dtypes into `@ops.allowed_dtypes` (`_OOTDtypePatcher`)
+6. Applies skip, xfail, or mandatory_success to each generated variant
+7. Adds custom markers to tests for provenance
+8. Injects custom input arguments at test call time
+
+### 2.3 The `@onlyNativeDeviceTypes` / `@onlyNativeDeviceTypesAnd` problem
+
+Two upstream decorators restrict tests to a hardcoded set of "native" devices:
+
+```python
+NATIVE_DEVICES = ('cpu', 'cuda', 'xpu', 'meta', 'mps', 'mtia',
+                  torch._C._get_privateuse1_backend_name())
+```
+
+Although `NATIVE_DEVICES` already includes the registered backend name (e.g.
+`"spyre"`), `TorchTestBase.setUpClass` resets `cls.device_type` to the literal
+string `"privateuse1"` so that `PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1`
+filters work correctly. At test runtime the decorator therefore sees
+`self.device_type == "privateuse1"`, which is **not** in `NATIVE_DEVICES`, and
+raises `unittest.SkipTest`.
+
+`_OOTNativeDeviceTypesPatcher` fixes this by appending `"privateuse1"` to the
+`NATIVE_DEVICES` tuple in the `common_device_type` module namespace once per
+process, before any test variant runs:
+
+```python
+class _OOTNativeDeviceTypesPatcher:
+    @staticmethod
+    def patch() -> None:
+        import torch.testing._internal.common_device_type as _cdt
+        if "privateuse1" not in _cdt.NATIVE_DEVICES:
+            _cdt.NATIVE_DEVICES = _cdt.NATIVE_DEVICES + ("privateuse1",)
+```
+
+The patch is called at the top of `instantiate_test` alongside
+`_OOTOnlyOnPatcher`. Because it is idempotent, repeated calls across many
+`instantiate_test` invocations are safe.
 
 ---
 
@@ -1678,6 +1713,11 @@ test_suite_config:
 - Global supported ops and dtypes
 - Force xfail at op level
 - Precision overrides per op/dtype
+- `@onlyNativeDeviceTypes` and `@onlyNativeDeviceTypesAnd` patching via
+  `_OOTNativeDeviceTypesPatcher`: injects `"privateuse1"` into the module-level
+  `NATIVE_DEVICES` tuple in `torch.testing._internal.common_device_type` so that
+  tests guarded by these decorators are not skipped when `self.device_type` is
+  `"privateuse1"` at runtime
 - Dynamic pytest markers for op name, dtype, and module name with typed prefixes
   (`op__`, `dtype__`, `module__`), enabling filtering like
   `pytest -m "op__torch_add"`, `pytest -m "dtype__float16"`,
