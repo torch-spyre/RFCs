@@ -278,10 +278,10 @@ Marker naming convention:
 - Op name: `torch.nn.functional.embedding` -> `op__torch_nn_functional_embedding`
 - Dtype: `torch.float16` -> `dtype__float16`
 - Module name: `nn.BatchNorm2d` -> `module__nn_BatchNorm2d`
+- Platform architecture: `x86_64` -> `platform__x86_64`, `ppc64le` -> `platform__ppc64le`
 
-Prefixes (`op__`, `dtype__`, `module__`) make the marker type unambiguous and prevent
-collisions between op names, dtype names, and module names that might otherwise overlap.
-
+Prefixes (`op__`, `dtype__`, `module__`, `platform__`) make the marker type unambiguous and prevent
+collisions between op names, dtype names, module names, and platform identifiers that might otherwise overlap.
 This enables filtering by specific op, dtype, or module without modifying the YAML config:
 
 ```bash
@@ -311,12 +311,25 @@ bash run_test.sh configs/example_test_config.yaml -v -m "module__nn_Linear and d
 
 # Collect only for modules
 bash run_test.sh configs/example_test_config.yaml -v -m "module__nn_BatchNorm2d" --collect-only
+
+# Run all tests on a specific platform architecture
+bash run_test.sh configs/example_test_config.yaml -v -m "platform__x86_64"
+
+# Combine platform with op filter
+bash run_test.sh configs/gpt_oss_20b_spyre.yaml -v -m "platform__ppc64le and op__torch_add"
+
+# Combine platform with dtype and YAML-defined tag
+bash run_test.sh configs/gpt_oss_20b_spyre.yaml -v -m "platform__x86_64 and dtype__float16 and model_1"
 ```
+
 
 Note: Dots in op and module names are replaced with underscores since pytest markers do
 not support dots. The mapping is 1:1 - `op__torch_nn_functional_embedding` always refers
 to `torch.nn.functional.embedding`, and `module__nn_BatchNorm2d` always refers to
-`nn.BatchNorm2d` (the short name used by upstream `module_info.name`).
+`nn.BatchNorm2d` (the short name used by upstream `module_info.name`). Platform markers
+are derived from `platform.machine()` with non-alphanumeric characters replaced by
+underscores — the marker is constant for the lifetime of the process and identical across
+all variants in a test run.
 
 ### 5.3 Edits
 
@@ -1718,10 +1731,12 @@ test_suite_config:
   `NATIVE_DEVICES` tuple in `torch.testing._internal.common_device_type` so that
   tests guarded by these decorators are not skipped when `self.device_type` is
   `"privateuse1"` at runtime
-- Dynamic pytest markers for op name, dtype, and module name with typed prefixes
-  (`op__`, `dtype__`, `module__`), enabling filtering like
-  `pytest -m "op__torch_add"`, `pytest -m "dtype__float16"`,
-  and `pytest -m "module__nn_BatchNorm2d"` without any YAML configuration
+- Dynamic pytest markers for op name, dtype, module name, and platform architecture
+  with typed prefixes (`op__`, `dtype__`, `module__`, `platform__`), enabling filtering
+  like `pytest -m "op__torch_add"`, `pytest -m "dtype__float16"`,
+  `pytest -m "module__nn_BatchNorm2d"`, and `pytest -m "platform__x86_64"` without any
+  YAML configuration. The `platform__` marker is resolved once from `platform.machine()`
+  at import time and attached to every test variant unconditionally
 
 ### Phase 2: Current (In progress)
   - Per-test input argument specification via `edits.inputs`
@@ -1795,6 +1810,12 @@ pytest test_model_ops_v2.py -m "op__torch_add and dtype__float16"
 
 # Combine module + dtype
 pytest test_modules.py -m "module__nn_Linear and dtype__float32"
+
+# Combine with YAML tags
+pytest test_model_ops_v2.py -m "gpt-oss-20b and op__torch_nn_functional_embedding"
+
+# Combine platform with op
+pytest test_model_ops_v2.py -m "platform__ppc64le and op__torch_add"
 
 # Combine with YAML tags
 pytest test_model_ops_v2.py -m "gpt-oss-20b and op__torch_nn_functional_embedding"
