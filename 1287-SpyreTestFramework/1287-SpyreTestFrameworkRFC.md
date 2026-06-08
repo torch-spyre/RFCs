@@ -331,6 +331,31 @@ are derived from `platform.machine()` with non-alphanumeric characters replaced 
 underscores — the marker is constant for the lifetime of the process and identical across
 all variants in a test run.
 
+#### Platform-specific slow test tags
+
+Some tests are prohibitively slow on specific hardware architectures. The framework
+supports static `slow_<arch>` tags declared in the YAML config to suppress these tests
+automatically on the affected platform — no command-line flags required.
+
+Supported slow tags:
+
+| Tag | Platform | `uname -m` |
+|---|---|---|
+| `slow__plat_ppc64` | IBM Power (ppc64le) | `ppc64*` |
+| `slow__plat_s390x` | IBM Z (s390x) | `s390x*` |
+| `slow__plat_aarch64` | ARM 64-bit | `aarch64`, `arm64` |
+
+When `run_test.sh` detects a non-x86_64 platform at startup, it automatically injects
+`-m "not slow_<arch>"` into the pytest invocation. On x86_64 (the baseline CI platform)
+no filtering is applied. The log line confirms what happened:
+
+```bash
+On ppc64le:
+[torch_oot_device_tests_run] Platform ppc64le: auto-skipping tests tagged 'slow__plat_ppc64'
+On x86_64:
+[torch_oot_device_tests_run] Platform x86_64: no slow tag defined, all tests will run
+```
+
 ### 5.3 Edits
 
 #### 5.3.1 `edits.ops`
@@ -1193,6 +1218,28 @@ Use a weight matrix captured during model tracing as exact input, avoiding any s
 
 ---
 
+### 8.16 Skip slow tests automatically on IBM Power and IBM Z
+
+Large matmul tests with shapes like `M2048_K2048_N65536` are prohibitively slow on
+IBM Power (ppc64le) and IBM Z (s390x) hardware. Tag them in the YAML config once —
+`run_test.sh` auto-skips them on the affected platform with no flags required:
+
+```yaml
+- names:
+    - TestOps::test_large_matmul_matmul_2d_M2048_K2048_N65536
+    - TestOps::test_large_matmul_matmul_3d_M3_K11_N2880
+    - TestOps::test_large_matmul_matmul_3d2d_M3_K11_N2880
+    - TestOps::test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536
+  mode: mandatory_success
+  tags:
+    - ops__inductor-matmul
+    - slow__plat_ppc64    # auto-skipped on IBM Power (ppc64le)
+    - slow__plat_s390x    # auto-skipped on IBM Z (s390x)
+```
+
+On x86_64 these tests run normally — the tags are ignored on platforms that have
+no matching slow filter.
+
 ## 9. Field Reference Summary
 
 ### File entry
@@ -1737,6 +1784,11 @@ test_suite_config:
   `pytest -m "module__nn_BatchNorm2d"`, and `pytest -m "platform__x86_64"` without any
   YAML configuration. The `platform__` marker is resolved once from `platform.machine()`
   at import time and attached to every test variant unconditionally
+- Platform-aware slow test suppression via static `slow_<arch>` YAML tags
+  (`slow__plat_ppc64` for IBM Power, `slow__plat_s390x` for IBM Z, `slow__plat_aarch64` for ARM).
+  `run_test.sh` detects the current architecture via `uname -m` at startup and
+  automatically injects `-m "not slow_<arch>"` on non-x86_64 platforms. Adding a
+  slow test to a new platform requires only a YAML tag entry — no code changes
 
 ### Phase 2: Current (In progress)
   - Per-test input argument specification via `edits.inputs`
