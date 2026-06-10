@@ -124,7 +124,7 @@ if self.device_type not in NATIVE_DEVICES:
 `PrivateUse1TestBase.setUpClass` resets `cls.device_type` from `"privateuse1"`
 to the registered backend name (e.g. `"spyre"`). `NATIVE_DEVICES` already
 contains the registered name — but at test execution time `self.device_type` is
-`"spyre"` and `NATIVE_DEVICES` contains `"privateuse1"`, so the check still
+`"privateuse1"` and `NATIVE_DEVICES` contains `"spyre"`, so the check still
 fails. Both strings must be present.
 
 #### Proposed change
@@ -143,12 +143,9 @@ def setUpClass(cls):
     ...
     cls.primary_device = f"{cls.device_type}:{cls.device_mod.current_device()}"
 
-    import torch.testing._internal.common_device_type as _cdt
-    if "privateuse1" not in _cdt.NATIVE_DEVICES:
-        _cdt.NATIVE_DEVICES = _cdt.NATIVE_DEVICES + ("privateuse1",)
+    if "privateuse1" not in NATIVE_DEVICES:
+        NATIVE_DEVICES = NATIVE_DEVICES + ("privateuse1",)
 ```
-
-**Priority:** Critical — correctness bug, standalone PR, no API surface.
 
 ---
 
