@@ -27,18 +27,18 @@ The Spyre Comms only supports on-node (single server) communication. Multi-node 
 
 The Spyre Comms shared library will be linked in the Pytorch module.
 
-### Spyre CCL Pytorch Distributed Module
+### SpyreCCL Pytorch Distributed Module
 
 Pytorch's [distributed communication package](https://docs.pytorch.org/docs/2.10/distributed.html) (a.k.a., `torch.distributed`) provides point-to-point and collective communication interface for Pytorch users. Backends to `torch.distributed` can support one or more device types. There are a few built-in backends (e.g., `gloo`, `nccl`). Pytorch also provides support for [external backends](https://docs.pytorch.org/tutorials/intermediate/process_group_cpp_extension_tutorial.html) through the extensions interface by extending the [`Backend` class](https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/Backend.hpp).
 
-We will implement the `spyre_ccl` backend module by extending the `Backend` class, and registering this backend module to be the default `torch.distributed` module for the `spyre` device. Since Spyre Comms provides a C++ interface, the core implementation of the `spyre_ccl` module will be in C++.
+We will implement the `spyreccl` backend module by extending the `Backend` class, and registering this backend module to be the default `torch.distributed` module for the `spyre` device. Since Spyre Comms provides a C++ interface, the core implementation of the `spyreccl` module will be in C++.
 
 ```cpp
     py::object module = py::module::import("torch.distributed");
     py::object register_backend = module.attr("Backend").attr("register_backend");
     std::vector<std::string> supported_devices;
     supported_devices.push_back("spyre");
-    register_backend("spyre_ccl", py::cpp_function(createSpyreCCLBackend), false, supported_devices);
+    register_backend("spyreccl", py::cpp_function(createSpyreCCLBackend), false, supported_devices);
 ```
 
 A check will be provided to throw an exception when a non-`spyre` tensor is passed to the library. Users should be protected from this naturally via the dispatch mechanism provided by `torch.distributed`, however users may circumvent this dispatch manually for specific devices (e.g., `cpu`).
@@ -51,15 +51,15 @@ We plan to support functional collectives via the same fallback into `torch.dist
 
 ## Usability
 
-The `spyre_ccl` backend will be autoloaded with the `spyre` device at `import torch` time. Thus the user does not need any explicit imports to bring in this capability.
+The `spyreccl` backend will be autoloaded with the `spyre` device at `import torch` time. Thus the user does not need any explicit imports to bring in this capability.
 
-Users must first initialize the `torch.distributed` process group. Since the `spyre_ccl` is autoloaded and registered as the default module for the `spyre` device it is available without any additional arguments.
+Users must first initialize the `torch.distributed` process group. Since the `spyreccl` is autoloaded and registered as the default module for the `spyre` device it is available without any additional arguments.
 
 ```python
 torch.distributed.init_process_group()
 
 # Users may explicitly load it if they wish, but do not need to
-# torch.distributed.init_process_group(f"spyre:spyre_ccl")
+# torch.distributed.init_process_group(f"spyre:spyreccl")
 ```
 
 The `torch.distributed` library will route the collective call to the default backend module for the tensor. For Spyre users, they can call the Spyre Comms library through standard interfaces without any custom arguments.
@@ -69,7 +69,7 @@ The `torch.distributed` library will route the collective call to the default ba
 x = torch.rand(512, 1024, dtype=torch.float16)
 # Send the tensor to the Spyre device
 x_device = x.to("spyre")
-# Broadcast the tensor using the Spyre CCL library
+# Broadcast the tensor using the Spyre Comms library
 dist.broadcast(x_device, 0)
 ```
 
@@ -104,7 +104,7 @@ NA
 ## **Unresolved questions**
 
 * Eager execution of the `torch.distributed` interface in a compiled execution model introduces dispatching latency during model execution. Various projects have approached this performance problem in different ways. We will need to resolve this to realize the full performance capabilities of the hardware.
-* Eventually the Spyre Comms `spyre_ccl` module will provide full functional support. Due to time constraints, interface support will be prioritized by model framework needs. This may result in a 'long tail' for full functional completeness.
+* Eventually the Spyre Comms `spyreccl` module will provide full functional support. Due to time constraints, interface support will be prioritized by model framework needs. This may result in a 'long tail' for full functional completeness.
 
 ## Resolution
 
