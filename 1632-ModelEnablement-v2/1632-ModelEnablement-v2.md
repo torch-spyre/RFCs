@@ -3,7 +3,7 @@
 **Authors:**
 - [Ariel Gera](https://github.com/arielge)
 - [Benjamin Sznajder](https://github.com/BenjSz)
-- [Assaf Toledo](https://github.com/assaft)
+- [Assaf Toledo](https://github.com/assaftibm)
 
 ---
 
