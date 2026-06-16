@@ -41,10 +41,7 @@ For a full description of the approach, architecture, and onboarding process, re
 - RoPE replaced with precomputed rotation matrices (Spyre has no `sin`/`cos` ops)
 - RMSNorm patched to stay fp16 (Spyre does not support on-device dtype conversion)
 - Decoder layers compiled via `torch.compile(block_forward, dynamic=False)` using plain function closures instead of `DynamicCache` objects
-- LM head weight padded to `ceil(vocab/64)*64 + 64` for stick alignment
 - Custom generation loop with 64-block padded decode
-
-As of this writing, `hf-adapters` covers 15 adapters, 27 verified checkpoints, and 60+ compatible model variants.
 
 ### 2. Model ID and Status Labels
 
@@ -61,7 +58,58 @@ Each model is identified by its HuggingFace `model_id` (e.g., `google/gemma-3-4b
 
 Labels are assigned and updated as testing progresses. A model may hold multiple labels (e.g., `has adapter`, `has reference`, `verified on cpu`, `verified on spyre`).
 
-### 3. Testing Methodology
+### 3. Model Registry and Selection
+
+#### Registry File
+
+All tracked models are stored in a checked-in file (`models.csv`) in the repository. Each row represents one model, identified by its HuggingFace `model_id`. The remaining columns correspond to the status labels defined in section 2 — one boolean column per label (e.g., `has_adapter`, `runnable_on_spyre`, `has_reference`, `verified_on_cpu`, `verified_on_gpu`, `verified_on_spyre`). Label columns are updated in place as testing progresses.
+
+The registry is append-only with respect to model selection: once a model is added, it remains in the file permanently regardless of whether subsequent scans would still surface it. This ensures stability — the tracked set is never silently altered by shifts in HuggingFace popularity rankings.
+
+#### Selection Scan
+
+The selection scan is a script that identifies new candidate models to append to `models.csv`. It runs on demand (e.g., when the team wants to expand coverage) and outputs a summary of the projected registry state after the candidates are added.
+
+The scan proceeds as follows:
+
+1. **Fetch the top 10k models** from HuggingFace sorted by downloads (`https://huggingface.co/models?sort=downloads`), forming the candidate pool.
+
+2. **Apply hard filters** to skip models not currently supportable:
+   - Mixture-of-experts architectures
+   - Models exceeding 20 billion parameters
+   - Any other unsupported architecture or quantization constraints
+
+   These filters are expected to evolve as Spyre support expands.
+
+3. **Skip models already in the registry.** Any `model_id` present in `models.csv` is excluded from consideration — it has already been processed.
+
+4. **Split candidates by type** into a generative pool and an embedding pool.
+
+5. **Group each pool by model family.** A model family is determined by the base architecture or origin (e.g., Llama, Qwen, Gemma, Mistral, BGE, E5). Within each family, models are ordered by download count descending.
+
+6. **Interleave picks across families** using round-robin within each pool, advancing one model per family per round. This prevents any single family from dominating the additions — if one round exhausts a family's candidates, that family is skipped in subsequent rounds until new candidates appear.
+
+7. **Balance generative and embedding picks** by maintaining a target ratio between the two pools throughout the interleaving. The ratio is a configurable parameter. This prevents the generative pool (which dominates the top of the download rankings) from crowding out embedding models in the additions.
+
+8. **Append candidates to `models.csv`**, with all label columns set to `false`.
+
+#### Scan Output
+
+After appending, the scan prints a summary reflecting the projected state of `models.csv`. This gives the team visibility into coverage without requiring manual review of the full list. The summary includes:
+
+- Total models in registry (before and after)
+- Count and percentage of generative vs. embedding models
+- Per-family counts and their share of the total
+- Count of models per label (e.g., how many are `verified_on_spyre`)
+- Number of models added in this run, broken down by type and family
+
+### 5. Reference Output Storage
+
+Reference outputs (golden files) are stored directly in the test directory alongside the tests that use them. Each golden file contains the expected output for a specific model under a specific input, and is committed to the repository as a versioned artifact. When a model's reference output needs to be updated — due to a model update, adapter change, or intentional behavior shift — the golden file is regenerated and the diff is reviewed as part of the PR.
+
+This approach keeps tests self-contained: running a test requires no external storage or network access, and changes to expected outputs are visible in code review.
+
+### 6. Testing Methodology
 
 Tests are scoped differently depending on model type. In all cases, the test compares the adapted model's output against the reference output collected under the `has reference` label.
 
@@ -77,7 +125,7 @@ Tests are scoped differently depending on model type. In all cases, the test com
 - **Input:** a fixed sentence of text
 - **Output compared:** the per-token embedding vectors
 
-### 4. CI/CD Regression Testing
+### 7. CI/CD Regression Testing
 
 Regression tests verify that models previously labeled `verified on spyre` continue to work correctly after code changes. Three tiers are defined:
 
