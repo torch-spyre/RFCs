@@ -189,7 +189,6 @@ Regression tests verify that models previously labeled `verified on spyre` conti
 
 ## Unresolved Questions
 
-- **Reference output management:** where are reference outputs stored, how are they versioned, and when should they be regenerated?
 - **Label ownership:** who is responsible for updating labels, and is this manual or automated via CI?
 - **PR model selection:** which 2–3 models should be in the PR tier, and how should that list be maintained as the supported set grows?
 - **Nightly model list:** criteria for a model to be included in the "must-work" nightly list
