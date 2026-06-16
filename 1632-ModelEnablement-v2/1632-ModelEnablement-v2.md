@@ -62,17 +62,23 @@ Labels are assigned and updated as testing progresses. A model may hold multiple
 
 #### Registry File
 
-All tracked models are stored in a checked-in file (`models.csv`) in the repository. Each row represents one model, identified by its HuggingFace `model_id`. The remaining columns correspond to the status labels defined in section 2 — one boolean column per label (e.g., `has_adapter`, `runnable_on_spyre`, `has_reference`, `verified_on_cpu`, `verified_on_gpu`, `verified_on_spyre`). Label columns are updated in place as testing progresses.
+All tracked models are stored in a checked-in file (`models.csv`) in the repository. Each row represents one model with the following columns:
 
-The registry is append-only with respect to model selection: once a model is added, it remains in the file permanently regardless of whether subsequent scans would still surface it. This ensures stability — the tracked set is never silently altered by shifts in HuggingFace popularity rankings.
+- `model_id` — the HuggingFace model identifier, used as the primary key
+- `type` — either `generative` or `embedding`
+- One boolean column per status label (e.g., `has_adapter`, `runnable_on_spyre`, `has_reference`, `verified_on_cpu`, `verified_on_gpu`, `verified_on_spyre`)
+
+Label columns are updated in place as testing progresses. The registry is append-only with respect to model selection: once a model is added, it remains in the file permanently regardless of whether subsequent scans would still surface it. This ensures stability — the tracked set is never silently altered by shifts in HuggingFace popularity rankings.
 
 #### Selection Scan
 
 The selection scan is a script that identifies new candidate models to append to `models.csv`. It runs on demand (e.g., when the team wants to expand coverage) and outputs a summary of the projected registry state after the candidates are added.
 
-The scan proceeds as follows:
+Two independent scans are run — one for generative models and one for embedding models — each fetching the top 5k models of that type from HuggingFace sorted by downloads. This keeps the two populations cleanly separated and ensures embedding models are not crowded out by the more numerous generative models.
 
-1. **Fetch the top 10k models** from HuggingFace sorted by downloads (`https://huggingface.co/models?sort=downloads`), forming the candidate pool.
+Each scan proceeds as follows:
+
+1. **Fetch the top 5k models** of the given type from HuggingFace sorted by downloads, forming the candidate pool.
 
 2. **Apply hard filters** to skip models not currently supportable:
    - Mixture-of-experts architectures
@@ -81,27 +87,18 @@ The scan proceeds as follows:
 
    These filters are expected to evolve as Spyre support expands.
 
-3. **Skip models already in the registry.** Any `model_id` present in `models.csv` is excluded from consideration — it has already been processed.
+3. **Skip models already in the registry.** Any `model_id` present in `models.csv` is excluded from consideration.
 
-4. **Split candidates by type** into a generative pool and an embedding pool.
-
-5. **Group each pool by model family.** A model family is determined by the base architecture or origin (e.g., Llama, Qwen, Gemma, Mistral, BGE, E5). Within each family, models are ordered by download count descending.
-
-6. **Interleave picks across families** using round-robin within each pool, advancing one model per family per round. This prevents any single family from dominating the additions — if one round exhausts a family's candidates, that family is skipped in subsequent rounds until new candidates appear.
-
-7. **Balance generative and embedding picks** by maintaining a target ratio between the two pools throughout the interleaving. The ratio is a configurable parameter. This prevents the generative pool (which dominates the top of the download rankings) from crowding out embedding models in the additions.
-
-8. **Append candidates to `models.csv`**, with all label columns set to `false`.
+4. **Append remaining candidates to `models.csv`** in download-rank order, with `type` set accordingly and all label columns set to `false`.
 
 #### Scan Output
 
-After appending, the scan prints a summary reflecting the projected state of `models.csv`. This gives the team visibility into coverage without requiring manual review of the full list. The summary includes:
+After appending, the scan prints a summary reflecting the projected state of `models.csv`. The summary includes:
 
 - Total models in registry (before and after)
 - Count and percentage of generative vs. embedding models
-- Per-family counts and their share of the total
 - Count of models per label (e.g., how many are `verified_on_spyre`)
-- Number of models added in this run, broken down by type and family
+- Number of models added in this run, per type
 
 ### 5. Reference Output Storage
 
