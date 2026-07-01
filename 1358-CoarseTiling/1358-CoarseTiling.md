@@ -5,7 +5,6 @@
 * @dgrove-oss
 * @tardieu
 
-
 A conceptual companion to the reference document
 [coarse_tiling_loops.md](https://github.com/torch-spyre/torch-spyre/blob/main/docs/source/compiler/coarse_tiling_loops.md).
 The reference doc describes *what* each attribute is and *how* the layers
@@ -201,24 +200,36 @@ all. Wrong type-system fit.
 
 ### At Layer 3, the loop is a serializable tree node
 
-`LoopSpec` has three fields:
+`LoopSpec` has two fields:
 
-- **`count`** — how many iterations.
-- **`body`** — what to run each iteration. A list whose elements can
+* **`count`** — how many iterations.
+* **`body`** — what to run each iteration. A list whose elements can
   themselves be `LoopSpec`s — that recursion is how nested loops are
   represented.
-- **`tiled_symbols`** — which iteration-space axes this loop sweeps.
 
-> *For each of `count` iterations, run `body`, advancing the
-> iteration-space symbols in `tiled_symbols` by one tile each step.*
+Each `OpSpec` inside the body carries its own **`tiled_symbols`** field
+recording which iteration-space axes this op's enclosing loops sweep.
+`tiled_symbols` is a list-of-lists, innermost first: `tiled_symbols[0]`
+holds the symbols tiled by the innermost enclosing loop, `tiled_symbols[1]`
+holds those for the next-outer level, and so on.
 
-Why three fields and not two: K=4 over a 2D tensor could mean 4 row
-strips, 4 column strips, or 4 diagonal blocks (both axes in lockstep).
+> *For each of `count` iterations, run `body`, advancing each op's
+> `tiled_symbols[0]` symbols by one tile each step.*
+
+Why per-op rather than per-loop: K=4 over a 2D tensor could mean 4 row
+strips, 4 column strips, or 4 diagonal blocks (both axes in lockstep) —
 `tiled_symbols` disambiguates by recording which axes the iteration
-index advances. It's a *list* because one loop level can sweep multiple
-axes simultaneously (the diagonal case), and on the loop rather than the
-body op because different loop levels sweep different axes — the body
-is direction-agnostic.
+index advances. The axes to advance are *op-specific* because
+work-division can place a batch dimension at different positions in
+different ops' iteration spaces inside the same loop. A single
+per-loop symbol list can't serve them all; each op needs its own. The
+unroller reads `tiled_symbols[0]` per op independently and pops it when
+the level is consumed, leaving outer-level entries intact.
+
+(History note: the original design put `tiled_symbols` on `LoopSpec`,
+treating it as a loop attribute rather than an op attribute. That was
+the right *concept* but the wrong granularity — PR #2944 moved it to
+`OpSpec` to fix the unroller's per-op stride arithmetic.)
 
 `LoopSpec` lives in a different type system than
 `CountedLoopSchedulerNode`. The codegen output must be picklable for
@@ -227,10 +238,6 @@ generated wrapper; `BaseSchedulerNode` is neither. The transition
 between Layer 2 and Layer 3 happens at one specific function:
 `SuperDSCScheduling._codegen_counted_loop` takes the
 `CountedLoopSchedulerNode` and produces the `LoopSpec`.
-
-(Side note: a transitional `tiled_symbols` field also exists on
-`OpSpec` for legacy code paths. Conceptually it belongs only on the
-loop. Known minor wart — see PR #2250 review notes.)
 
 ---
 
@@ -290,6 +297,22 @@ reason Case 3 exists as a distinct case.
 A unified treatment that always allocated a full buffer and always
 inserted a copy would handle all three correctly but waste HBM in Case
 1 (defeating working-set reduction) and waste a copy op in Case 3.
+
+**Reduction-dim tiling** adds a fourth pattern outside the three-case
+taxonomy. Tiling along a reduction axis — e.g., splitting the K-dimension of
+a matrix multiply into K-tiles — produces per-tile *partial results* rather
+than per-tile slices of the output. These can't be assembled by addressing
+alone; they require a fill-initialize + per-tile combine. Before the loop
+starts (or once per outer-loop tile for nested tiling), the accumulation
+buffer is initialized to the reduction's identity value (0 for sum, −∞ for
+max, etc.). Inside the inner loop each partial result is merged into the
+accumulator with the appropriate binary operator. The three-case analysis
+still applies to the final accumulation buffer (Cases 2/3 govern how it is
+exposed to outside consumers), but the per-tile partial result is always a
+per-tile scratch (Case 1) — it feeds only the combine op inside the loop.
+The fundamental invariant is unchanged: the perimeter still governs what
+crosses the loop boundary; reduction tiling just changes the shape of what
+the producer side needs to produce.
 
 ---
 
