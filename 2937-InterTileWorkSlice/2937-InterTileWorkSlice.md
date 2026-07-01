@@ -198,7 +198,7 @@ convention, like the `BLOCK_*` constexprs):
 
 ```python
 # 8 tiles, 4 reduction groups × 2 within-group tiles.
-#   "x" = reduction-axis slice (group label)
+#   "x" = reduction-axis slice index (which reduction group this tile belongs to)
 #   "n" = within-group slice index (which member of the group)
 WORK_SLICES = [
     {"x": 0, "n": 0}, {"x": 0, "n": 1},
@@ -208,9 +208,9 @@ WORK_SLICES = [
 ]
 ```
 
-**Both the group label *and* the within-group index are explicit.** A tile's entry
+**Both the reduction-axis slice index *and* the within-group index are explicit.** A tile's entry
 names its slice on *every* axis, not just the reduction axis: `"x"` says which
-group the tile belongs to, and `"n"` says which member it is *within* that group.
+reduction group the tile belongs to, and `"n"` says which member it is *within* that group.
 This is a deliberate design requirement, not redundancy — the within-group index
 is what `pick₀` (`reduce_to_one`) and `DEP_WORK_SLICES` (§4.8) key off, and what
 lets `tl.wk_slice_coord` recover *any* coordinate the body needs (§4.3). A map
@@ -317,7 +317,7 @@ def inter_tile_add_kernel(x_ptr, output_ptr, M, N,
                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                           NUM_N_TILES: tl.constexpr,
                           WORK_SLICES: tl.constexpr):
-    pid_m = tl.wk_slice_coord(WORK_SLICES, "x")   # group label
+    pid_m = tl.wk_slice_coord(WORK_SLICES, "x")   # reduction-axis slice index
     pid_n = tl.wk_slice_coord(WORK_SLICES, "n")   # within-group column
 
     x_desc   = tl.make_tensor_descriptor(x_ptr,      shape=[M, N], strides=[N, 1],
