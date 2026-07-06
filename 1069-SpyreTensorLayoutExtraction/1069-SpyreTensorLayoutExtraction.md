@@ -277,7 +277,7 @@ A new optional field `spyre_layout` has been added to `InputTensorSpec` in `test
     spyre_layout:
       device_size: [4, 1, 32]
       stride_map: [32, -1, 1]
-      device_dtype: DataFormats.IEEE_INT32  # optional
+      device_dtype: DataFormats.IEEE_INT32
 ```
 
 **Fields:**
@@ -286,7 +286,7 @@ A new optional field `spyre_layout` has been added to `InputTensorSpec` in `test
 |---|---|---|---|
 | `device_size` | `List[int]` | Yes | Explicit device dimensions after stickification. Must have the same length as `stride_map`. |
 | `stride_map` | `List[int]` | Yes | Stride mapping in device space. Use `-1` for broadcast/collapsed dimensions. |
-| `device_dtype` | `str` | No | Device data format string (e.g., `DataFormats.IEEE_FP32`, `DataFormats.IEEE_INT32`). Defaults to the format inferred from the tensor `dtype` if omitted. |
+| `device_dtype` | `str` | Yes | Device data format string (e.g., `DataFormats.IEEE_FP32`, `DataFormats.IEEE_INT32`). Defaults to the format inferred from the tensor `dtype` if omitted. |
 
 **Validation:** At load time, `SpyreTensorLayoutSpec.validate_layout_format` asserts that `len(device_size) == len(stride_map)`. A mismatch raises a `ValueError` immediately, before any test runs.
 
