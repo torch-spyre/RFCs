@@ -50,7 +50,7 @@ STAGGERED FP32 = what the hardware actually emits  (no reshuffle):
 Every value is present; only within-stick position is scrambled, and the
 permutation is illustrative — nothing may depend on it, only on its being
 *consistent* per EA value. The legality rule follows: **an op is safe on
-staggered inputs if it never consults within-stick position.**
+staggered inputs if and only if it never consults within-stick position.**
 
 ```
 unary point-wise    exp([e0 e2 e4 e6]) = [exp e0, exp e2, ...]    OK  position never consulted
@@ -195,7 +195,7 @@ and enforced? Five gaps:
    when the tensor doesn't start on a stick boundary — an acceptable constraint,
    but the bail should be a hard-fail, not a silent drop.
 5. **Standalone eager conversion.** Eager `.to(fp32)` up/downcasts conversions not
-   ensure backet-closure and not guaranteed to output standard FP32
+   ensure bracket-closure and not guaranteed to output standard FP32
 
 **Debug aid.** With no device-side un-stagger, inspection is host-side: copy the
 staggered FP32 to host verbatim and reverse the permutation there for golden
