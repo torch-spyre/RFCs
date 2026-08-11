@@ -51,11 +51,9 @@ This makes it extremely difficult to identify performance bottlenecks in distrib
 
 ### Short Term Goals
 
-#### 3.1. [DONE] Pass collective info to flex by encoding collective metadata into operation name strings
+#### 3.1. Pass collective info to flex by encoding collective metadata into operation name strings
 
-PRs:
-
-- spyre-comms#268 — encodes collective metadata into operation name strings using a structured format:
+- Spyre-comms - Encode collective metadata into operation name strings using a structured format:
 ```
 [CollType,Algorithm,Bytes] OperationName
 ```
@@ -63,7 +61,7 @@ For example: `[AllReduce,AllReduce_AllGatherSum,2048] Send`
 
 It adds a `pushCollectiveAnnotation()`/`popCollectiveAnnotation()` mechanism in `SpyreCommsContext` that prepends this metadata to all Send/Recv/DMA operation names within a collective's `Convert()` method.
 
-- flex#1455 — Parses this structured format in `extractCollMetadata()` and adds `CollAlgo` and `CollBytes` as profiler attributes alongside the existing `CollGroup`. It also threads `op_name` through the H2D/D2H runtime operation path so DMA transfers appear with meaningful names in traces.
+- Flex - Parse this structured format in `extractCollMetadata()` and add `CollAlgo` and `CollBytes` as profiler attributes alongside the existing `CollGroup`. It should also thread `op_name` through the H2D/D2H runtime operation path so DMA transfers appear with meaningful names in traces.
 
 
 #### 3.2. Add `AIU_TIMING` instrumentation to spyre-comms core paths
