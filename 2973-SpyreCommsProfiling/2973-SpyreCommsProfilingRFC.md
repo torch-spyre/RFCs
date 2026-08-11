@@ -171,10 +171,13 @@ Integrate the flex unified profiler (or a shared profiling library extracted fro
 
 Environment-variable controlled granularity:
 ```
-SPYRE_COMMS_PROFILE=0    # Disabled (zero overhead)
-SPYRE_COMMS_PROFILE=1    # Collective-level only (one span per allreduce/allgather/etc.)
-SPYRE_COMMS_PROFILE=2    # Algorithm-step-level (individual sends/recvs within collective)
-SPYRE_COMMS_PROFILE=3    # Full (includes host overhead, queue depths, metadata)
+SPYRE_COMMS_PROFILE=off          # Disabled (single atomic check fast path)
+SPYRE_COMMS_PROFILE=collective   # One span per collective
+SPYRE_COMMS_PROFILE=step         # Individual sends and recvs within a collective
+SPYRE_COMMS_PROFILE=full         # Adds host overhead, queue depths, metadata
+
+SPYRE_COMMS_PROFILE_RANKS=all    # Which ranks emit (all, 0, or 0,2)
+SPYRE_COMMS_PROFILE_OUTPUT=trace # Output format: trace, text, or both
 ```
 
 ---
