@@ -12,7 +12,7 @@ Flex has a mature unified profiling system with three backends (TIMING, FLEX/Chr
 - Per-step breakdown within a collective algorithm (e.g., individual ring steps in a pipeline allreduce)
 - Overhead of P2P protocol setup (message matching, HDMA channel management)
 
-This makes it extremely difficult to identify performance bottlenecks in distributed workloads, compare algorithm choices, or understand the communication/computation overlap.
+This makes it extremely difficult to identify performance bottlenecks in distributed workloads, compare algorithm choices, or understand the communication/computation overlap. (Scope is restricted to single node scenarios.)
 
 ---
 
@@ -45,7 +45,7 @@ This makes it extremely difficult to identify performance bottlenecks in distrib
 1. **Unified with flex profiler** — events from spyre-comms should appear in the same Chrome trace / AIUPTI stream as flex events
 2. **Structured metadata** — collective info passed as metadata having typed fields
 3. **Hierarchical** — collective → algorithm steps → individual P2P operations, visible as nested spans
-4. **Opt-in granularity** — env-var controlled verbosity levels (collective-level vs. step-level vs. operation-level)
+4. **Opt-in granularity** — env-var controlled, independently selectable categories (collective, step, host, counters)
 5. **Low overhead** — Profiling disabled by default; when enabled, acceptable overhead (<10%)
 ---
 
@@ -103,7 +103,7 @@ struct CommOperationMetadata {
 
 Pass this through `DmaParams`, `P2PRdmaSendParams`, `P2PRdmaWaitParams`, etc., instead of embedding in `op_name` strings. This eliminates the regex parsing in flex's `pf_runtime_scheduler.cpp`.
 
-**Rank tagging:** The `rank` field is populated using peer rank information obtained from the spyrecomm / spyreCCL backend. The collective algorithm layer in spyre-comms already tracks peer rank for each send/recv operation; this is propagated into the metadata at the operation dispatch boundary. If no rank is invoved (for e.g. in `op` or `memcpy`), the `UINT64_MAX` is passed as the rank.
+**Rank tagging:** The `rank` field is populated from the rank and size held by the SpyreCCL backend and the communicator context. The collective algorithm layer already tracks the peer rank for each send and recv, so this is propagated into the metadata at the operation dispatch boundary. If no rank is involved (for e.g. in `op` or `memcpy`), the `UINT64_MAX` is passed as the rank.
 
 
 #### 3.4. Add collective-level profiling events visible in flex traces
@@ -133,6 +133,9 @@ Emit the following event classes at the protocol level:
 |---|---|---|
 | SEND_DATA | Send: outbound DMA data transfer | Time (usec), Bytes, Peer |
 | SIGNAL_DATA | Send: signaling instruction | Time (usec), Peer |
+| SIGNAL_ACK | Host DMA | Send: signal acknowledgement | Time (usec), Peer |
+| WAIT_DATA | Host DMA | Recv: wait for inbound data | Time (usec) |
+| WAIT_ACK | Host DMA | Recv: wait for acknowledgement | Time (usec) |
 | MONITOR_NOTICE | Recv: wait for delivery notice *(optional — only present for Host DMA in PF mode)* | Time (usec) |
 | RECV_DATA | Recv: inbound DMA data transfer | Time (usec), Bytes, Peer |
 | COMPUTE | Op: local compute (e.g., sum reduction) | Time (usec) |
@@ -169,15 +172,26 @@ Integrate the flex unified profiler (or a shared profiling library extracted fro
 
 #### 3.8. Profiling verbosity levels
 
-Environment-variable controlled granularity:
-```
-SPYRE_COMMS_PROFILE=off          # Disabled (single atomic check fast path)
-SPYRE_COMMS_PROFILE=collective   # One span per collective
-SPYRE_COMMS_PROFILE=step         # Individual sends and recvs within a collective
-SPYRE_COMMS_PROFILE=full         # Adds host overhead, queue depths, metadata
+Granularity is selected by semantic keywords rather than numeric levels. Numeric levels are opaque at the call site (`SPYRE_COMMS_PROFILE=2` says nothing about what it enables) and, more importantly, a single ordered ladder forces unrelated concerns to be enabled together.
 
-SPYRE_COMMS_PROFILE_RANKS=all    # Which ranks emit (all, 0, or 0,2)
-SPYRE_COMMS_PROFILE_OUTPUT=trace # Output format: trace, text, or both
+Categories are therefore **independently selectable** and may be combined with commas:
+
+```
+SPYRE_COMMS_PROFILE=off                    # Disabled (default; single atomic check fast path)
+SPYRE_COMMS_PROFILE=collective             # One span per collective (allreduce/allgather/...)
+SPYRE_COMMS_PROFILE=step                   # Per-operation spans within a collective (implies collective)
+SPYRE_COMMS_PROFILE=host                   # Host-side cost: algorithm selection, schedule build, bundle gen
+SPYRE_COMMS_PROFILE=all                    # Every category (alias: full)
+
+SPYRE_COMMS_PROFILE=collective,host        # Combine categories
+```
+
+**Rank selection** — per-rank traces multiply with world size, so emission can be restricted:
+
+```
+SPYRE_COMMS_PROFILE_RANKS=all              # Default: every rank emits
+SPYRE_COMMS_PROFILE_RANKS=0                # Only rank 0
+SPYRE_COMMS_PROFILE_RANKS=0,2              # Ranks 0 and 2
 ```
 
 ---
