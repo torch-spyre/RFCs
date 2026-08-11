@@ -164,6 +164,7 @@ Integrate the flex unified profiler (or a shared profiling library extracted fro
 | **Queue depth** | Outstanding operations in flight | Counter in `WorkSchedule` |
 | **Wait time breakdown** | Time blocked on recv vs. compute vs. host | Decompose `wait()` into sub-categories |
 | **Algorithm selection accuracy** | Did `CostEstimator` pick the fastest algorithm? | Compare estimated vs. actual time across algorithms |
+| **Latency distribution** | Min, median, average, max, and standard deviation per collective type | Aggregate across repeated collectives in a job |
 
 
 #### 3.8. Profiling verbosity levels
