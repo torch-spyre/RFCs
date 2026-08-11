@@ -68,7 +68,7 @@ It adds a `pushCollectiveAnnotation()`/`popCollectiveAnnotation()` mechanism in 
 
 #### 3.2. Add `AIU_TIMING` instrumentation to spyre-comms core paths
 
-Instrument the following critical paths using the already-available `GlobalTimingProfile`:
+Instrument the following critical paths using the already-available `GlobalTimingProfile` in the short term and in `AIUPTI` in the long term:
 
 - **`WorkSchedule::start()`** — total time from schedule submission to first operation launch
 - **`WorkSchedule::wait()`** — total blocking time waiting for completion
@@ -93,32 +93,34 @@ Replace string-encoded metadata with a structured type:
 struct CommOperationMetadata {
     std::string collective_type;   // "AllReduce", "AllGather", etc.
     std::string algorithm;         // "AllReduce_PipelineLinear", etc.
-    size_t total_bytes;            // Total data volume
+    size_t total_bytes;            // Total number of bytes sent or received in this step
     int step;                      // Step within algorithm (-1 if N/A)
     int total_steps;               // Total steps in algorithm (-1 if N/A)
-    int rank;                      // Source/destination rank (obtained from spyrecomm / spyreCCL backend)
-    std::vector<at::Tensor> input_tensors;
-    std::vector<at::Tensor> output_tensors;
+    uint64_t rank;                 // Source/destination rank (obtained from spyrecomm / spyreCCL backend)
+    uint64_t correlation_id;       // Identifies the collective invocation this op belongs to (see 3.4)
 };
 ```
 
 Pass this through `DmaParams`, `P2PRdmaSendParams`, `P2PRdmaWaitParams`, etc., instead of embedding in `op_name` strings. This eliminates the regex parsing in flex's `pf_runtime_scheduler.cpp`.
 
-**Rank tagging:** The `rank` field is populated using peer rank information obtained from the spyrecomm / spyreCCL backend. The collective algorithm layer in spyre-comms already tracks peer rank for each send/recv operation; this is propagated into the metadata at the operation dispatch boundary. For protocol events where only PCI addresses are visible, a PCI-to-rank mapping is built at initialization time from the `AIU_WORLD_RANK_x` environment variables.
+**Rank tagging:** The `rank` field is populated using peer rank information obtained from the spyrecomm / spyreCCL backend. The collective algorithm layer in spyre-comms already tracks peer rank for each send/recv operation; this is propagated into the metadata at the operation dispatch boundary. If no rank is invoved (for e.g. in `op` or `memcpy`), the `UINT64_MAX` is passed as the rank.
 
 
 #### 3.4. Add collective-level profiling events visible in flex traces
 
-Emit `PROFILER_START`/`PROFILER_STOP` events at the collective boundary so that a single span in the Chrome trace covers the entire collective operation (all its DMA/RDMA/compute sub-operations appear nested within it):
-
+Emit `PROFILER_START`/`PROFILER_STOP` events for the collective, so the trace shows both the host-side cost of submitting the collective and the device-side operations that carry it out.
 ```
-[AllReduce span] ──────────────────────────────
-  [H2D: Start H2D] ──
-  [Send step 0]     ────
-  [Recv step 0]     ────
-  [Compute: Sum]       ──
-  [Send step 1]          ────
-  [D2H: End D2H]              ──
+              t ────────────────────────────────────────────────▶
+ Host lane    [enqueue]                              [wait]
+ Device lane      [H2D] ──
+                     [Send 0] ────
+                     [Recv 0] ────
+                        [Sum] ──
+                           [Send 1] ────
+                                    [D2H] ──
+                  ├────── device duration ──────┤
+
+ All spans above share one correlation ID (one per collective invocation).
 ```
 
 This requires spyre-comms to call into the flex unified profiler API (or a thin wrapper exposed for this purpose).
@@ -131,10 +133,10 @@ Emit the following event classes at the protocol level:
 |---|---|---|
 | SEND_DATA | Send: outbound DMA data transfer | Time (usec), Bytes, Peer |
 | SIGNAL_DATA | Send: signaling instruction | Time (usec), Peer |
-| MONITOR_NOTICE | Recv: wait for delivery notice *(optional — only present for DMA in PF mode)* | Time (usec) |
+| MONITOR_NOTICE | Recv: wait for delivery notice *(optional — only present for Host DMA in PF mode)* | Time (usec) |
 | RECV_DATA | Recv: inbound DMA data transfer | Time (usec), Bytes, Peer |
-| COMPUTE_PREP | Op: pre-compute setup | Time (usec) |
-| COMPUTE_EXEC | Op: local compute (e.g., sum reduction) | Time (usec) |
+| COMPUTE | Op: local compute (e.g., sum reduction) | Time (usec) |
+| WAIT_ACK | Ack: Non-data related ACK signal | Time (usec) |
 
 #### 3.5. PyTorch profiler integration (AIUPTI path)
 
@@ -157,7 +159,7 @@ Integrate the flex unified profiler (or a shared profiling library extracted fro
 
 | Metric | Description | How to capture |
 |---|---|---|
-| **Effective bandwidth** | Actual bytes/sec achieved per collective | `total_bytes / wall_time` at collective boundary |
+| **Effective bandwidth** | Average of all actual bytes/sec achieved per data transfer | `bytes_per_data_chunk / transfer_time` at collective boundary |
 | **Algorithm efficiency** | Ratio of achieved vs. theoretical bandwidth | Compare against link bandwidth from `CostEstimator` model |
 | **Queue depth** | Outstanding operations in flight | Counter in `WorkSchedule` |
 | **Wait time breakdown** | Time blocked on recv vs. compute vs. host | Decompose `wait()` into sub-categories |
