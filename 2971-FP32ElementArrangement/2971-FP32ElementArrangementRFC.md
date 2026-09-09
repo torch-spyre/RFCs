@@ -9,89 +9,127 @@
 
 Widening a tensor's elements on device (16-bit `DL16`/`BF16` ↔ 32-bit `FP32`)
 does **not** reshuffle them into standard stick order — the wider elements come
-out **staggered** (all values correct, but within-stick position no longer matches
-logical order; "anywhere valid"). The inductor backend tracks this as an
-**Element Arrangement (EA)** per layout and gates op legality on it
-(`is_ea_compatible`, `validate_ops`); this RFC specifies those rules, today only
-in code (epic [#2971](https://github.com/torch-spyre/torch-spyre/issues/2971)).
+out **staggered**: all values are correct, but their position within the stick no
+longer matches logical order. The inductor backend tracks this as an **Element
+Arrangement (EA)** per layout and gates op legality on it (`is_ea_compatible`,
+`validate_ops`); this RFC specifies those rules, today only in code (epic
+[#2971](https://github.com/torch-spyre/torch-spyre/issues/2971)).
 
-What makes it tractable: FP32 is **ephemeral** — never stored, only a transient
-scoped to one precision-sensitive op, entered by an upcast and left by a downcast
-that un-staggers for free. "Completing FP32" is therefore bounded: turn on the
-up/downcast brackets for
-`layernorm`/`softmax` (they strip them today), enable other roles (RMSNorm), and
-add a bracket-closure check.
+There are two ways to deal with a staggered tensor.
+
+The cheap one is to keep FP32 **ephemeral**: a transient scoped to one
+precision-sensitive op, entered by an upcast and left by a downcast. The downcast
+puts the elements back in standard order at no cost, so nothing has to be
+rearranged. Every op inside the bracket is one that does not care about position.
+
+The general one is to **rearrange explicitly**. The backend can now move a tensor
+from one element arrangement to another, so a staggered tensor can be put back in
+standard order, or a standard one can be made staggered, without a width
+conversion. This costs bandwidth, so it is not the first choice, but it is
+available where the bracket is not.
+
+The ephemeral bracket is therefore the fast path rather than the only path. What
+"completing FP32" needs: turn the up/downcast brackets on for `layernorm` and
+`softmax` (they strip them today), enable other roles such as RMSNorm, and decide
+per case whether an unbracketed staggered value is rearranged or refused.
 
 ## What staggering is
 
-Spyre packs tensors into **sticks** — 128-byte units (64 elements at 16-bit, 32
-at 32-bit). Widening can't keep elements in place *and* in order: restoring
-standard order would redistribute them across sticks (expensive), so the
-conversion instead leaves them out of order within the stick — *staggered*:
+Spyre packs tensors into **sticks** — 128-byte units, holding 64 elements at
+16-bit or 32 at 32-bit. Widening cannot keep elements both in place and in order:
+putting them back in order would redistribute them across sticks, so the
+conversion leaves them out of order within the stick instead.
+
+The elements move in groups of four. Take one 16-bit stick as 16 such groups,
+`g0` to `g15`. Widening doubles their width, so they no longer fit in one stick
+and spill into two:
 
 ```
-Logical tensor:  e0 e1 e2 e3 e4 e5 e6 e7      (what the model "means")
+16-bit, STANDARD  (64 elements = 16 groups of 4, in one stick):
+  stick:   [ g0 g1 g2 g3 g4 g5 g6 g7 g8 g9 g10 g11 g12 g13 g14 g15 ]
 
-16-bit, STANDARD  (64 elems / 128B stick; shown as 8):
-  stick: [ e0 e1 e2 e3 e4 e5 e6 e7 ]
-
-        │  upcast 16-bit → FP32  (elements double in width → span 2 sticks)
+        │  upcast 16-bit → FP32
         ▼
 
-STANDARD FP32 would be  (needs a reshuffle — expensive):
-  stick A: [ e0 e1 e2 e3 ]
-  stick B: [ e4 e5 e6 e7 ]
-
-STAGGERED FP32 = what the hardware actually emits  (no reshuffle):
-  stick A: [ e0 e2 e4 e6 ]     <- even slots
-  stick B: [ e1 e3 e5 e7 ]     <- odd slots
+STAGGERED FP32  (32 elements = 8 groups per stick):
+  stick A: [ g0 g2 g4 g6 g8 g10 g12 g14 ]     <- even groups
+  stick B: [ g1 g3 g5 g7 g9 g11 g13 g15 ]     <- odd groups
 ```
 
-Every value is present; only within-stick position is scrambled, and the
-permutation is illustrative — nothing may depend on it, only on its being
-*consistent* per EA value. The legality rule follows: **an op is safe on
-staggered inputs if and only if it never consults within-stick position.**
+Every value is present. Only the position within the stick changes, and no op may
+depend on what that position is — only on its being the same for every tensor
+carrying the same EA. That gives the legality rule: **an op is safe on staggered
+inputs if and only if it never consults position within the stick.**
 
 ```
-unary point-wise    exp([e0 e2 e4 e6]) = [exp e0, exp e2, ...]    OK  position never consulted
+unary point-wise    exp([g0 g2 g4 ...]) = [exp g0, exp g2, ...]    OK  position never consulted
 
 binary, both staggered THE SAME:
-  [e0 e2 e4 e6] + [f0 f2 f4 f6] -> e0+f0, e2+f2, ...              OK  permutation cancels
+  [g0 g2 g4 ...] + [h0 h2 h4 ...] -> g0+h0, g2+h2, ...             OK  permutation cancels
 
 binary, staggered + STANDARD (no broadcast):        added slot-by-slot
-  [e0 e2 e4 e6] + [f0 f1 f2 f3] -> e0+f0, e2+f1, e4+f2, ...      BAD  logical indices don't line up
+  [g0 g2 g4 ...] + [h0 h1 h2 ...] -> g0+h0, g2+h1, ...            BAD  logical indices don't line up
 
 full-dim reduction over stick:
-  sum(e0 e2 e4 e6) + sum(e1 e3 e5 e7) = e0+e1+...+e7              OK  order irrelevant
+  sum(g0 g2 g4 ...) + sum(g1 g3 g5 ...) = sum of all               OK  order irrelevant
 ```
 
 So the **safe set** is unary point-wise, binary with identically-staggered
-operands (or one a stick-dim broadcast), and full-dim stick reductions. Everything
-else needs rearrangement, which the compiler rejects.
+operands (or one a stick-dim broadcast), and full-dim stick reductions. Anything
+else needs the operands put in a common arrangement first (see
+[Rearranging on device](#rearranging-on-device)).
 
-## FP32 is ephemeral
+## The ephemeral bracket
 
-FP32 is never stored on Spyre — it is a transient scoped to a **single**
-precision-sensitive op, bracketed by an upcast in and a downcast out:
+The cheapest way to use FP32 is not to let a staggered tensor outlive the op that
+needs it:
 
 ```
 16-bit  --upcast-->  FP32 (staggered)  --op-->  FP32 (staggered)  --downcast-->  16-bit
 ```
 
-So FP32 lives only in LX scratchpad and compute; every persisted tensor stays
-16-bit. Two consequences close the design:
+FP32 then lives only in temporary intermediate tensors, and every stored tensor
+stays 16-bit. Two things follow:
 
-* **The exit downcast is the free un-stagger.** `DL16_TO_FP32 → STANDARD` hands
-  the consumer a standard 16-bit tensor — so **no rearrangement primitive is ever
-  needed**.
-* **The safe set *is* the role set.** A precision-sensitive op decomposes into
-  exactly what's legal on staggered tensors. Softmax → `max, sub, exp, sum,
-  realdiv`; RMSNorm → `mean(x²), rsqrt, mul`; layernorm adds its `EXX2` partial
-  reduction.
+* **The downcast is a free un-stagger.** `DL16_TO_FP32 → STANDARD` hands the
+  consumer a standard 16-bit tensor as a side effect of narrowing it. A bracket
+  that ends this way never pays to rearrange, which is why it is the fast path.
+* **The safe set is the role set.** A precision-sensitive op decomposes into
+  exactly the ops that are legal on staggered tensors. Softmax → `max, sub, exp,
+  sum, realdiv`; RMSNorm → `mean(x²), rsqrt, mul`; layernorm adds its `EXX2`
+  partial reduction.
 
-Only the symmetric bracket is in scope; FP32-native flows, persisted upcasts, and
-standalone downcasts would put FP32 in storage and let a staggered tensor persist,
-so they are excluded.
+Flows that keep FP32 for longer (FP32 in storage, an upcast whose result is
+persisted, a downcast on its own) used to be ruled out partly because a staggered
+tensor would have had no way back to standard order. That is no longer so: such a
+flow can rearrange. What is left to decide about them is whether FP32 belongs in
+storage at all, and that depends on what the user asked for, or on the precision
+of the operations before and after.
+
+## Rearranging on device
+
+A data-movement op (`identity` and its `shuffle` alias) may have a different
+element arrangement on its input and its output. The backend implements the
+difference. It works out the largest piece of a stick that both arrangements hold
+the same way, moves the tensor one piece at a time, and writes each piece where
+the output arrangement wants it. Nothing else about the op changes.
+
+So an arrangement can be applied or undone on its own. A staggered tensor can be
+put back in standard order without narrowing it, and a standard one can be
+staggered to match another operand.
+
+Two limits. The pieces have to hold whole elements and be a size the load and
+store units can move; where only the order of whole sticks differs, whole sticks
+move. A permutation at a granularity the hardware does not support is refused. So
+is an arrangement that would put one element in two places.
+
+The staggered arrangements produced by fp16-fp32 upcasts and downcasts move
+elements in groups of four, so they are within these limits in both directions.
+
+The cost is bandwidth. Moving four elements at a time takes eight accesses where a
+standard tensor takes one, so a rearranged 32-bit tensor costs eight times the
+traffic, and a 16-bit one more. Avoiding a rearrangement is always faster. The
+point is that it is now a choice rather than a wall.
 
 ## EA values
 
@@ -99,9 +137,9 @@ EA is an `ElementArrangement` enum on each `SpyreTensorLayout`:
 
 | EA | Meaning | Produced by |
 |---|---|---|
-| `STANDARD` | sequential stick order | no/same-size conversion, or a restoring width conversion |
-| `DL16_TO_FP32` | staggered FP32 | widening `STANDARD` 16-bit → `FP32` |
-| `FP32_TO_DL16` | staggered 16-bit | narrowing `STANDARD` `FP32` → 16-bit |
+| `STANDARD` | sequential stick order | no/same-size conversion, a restoring width conversion, or a rearrangement |
+| `DL16_TO_FP32` | staggered FP32 | widening `STANDARD` 16-bit → `FP32`, or a rearrangement |
+| `FP32_TO_DL16` | staggered 16-bit | narrowing `STANDARD` `FP32` → 16-bit, or a rearrangement |
 | `EXX2` | reduction mode, two values/stick | layernorm partial reduction |
 | `QFP8CH` | FP8 quant output — **out of scope** | FP8 activation quantization |
 | `QFP8WT` | FP8 quant output — **out of scope** | FP8 weight quantization |
@@ -111,14 +149,17 @@ preserve the input device layout.
 
 ## Assignment and propagation
 
-**At a conversion**, a width change *creates* a staggered EA from `STANDARD` or
+**At a conversion**, a width change *creates* a staggered EA from `STANDARD`, or
 *restores* `STANDARD` from the opposite staggered tag; any other input EA is
-`Unsupported`:
+`Unsupported`. A rearrangement is not a conversion and does not touch element
+width, but it sets EA the same way, and it can go straight from one staggered EA
+to the other:
 
-| Width conversion | creates | restores |
+| Operation | creates | restores |
 |---|---|---|
 | widen 16-bit → `FP32` | `STANDARD` → `DL16_TO_FP32` | `FP32_TO_DL16` → `STANDARD` |
 | narrow `FP32` → 16-bit | `STANDARD` → `FP32_TO_DL16` | `DL16_TO_FP32` → `STANDARD` |
+| rearrange, width unchanged | `STANDARD` → either staggered EA | either staggered EA → `STANDARD` |
 
 **Through ops**, EA propagates forward: unary point-wise **preserves**, a full-dim
 stick reduction **clears** to `STANDARD`, and a multi-arg op's output follows the
@@ -147,8 +188,13 @@ def is_ea_compatible(eas):
 |---|---|---|
 | 1 | All identical | ✅ permutation absent or cancels |
 | 2 | One non-STANDARD EA (≠ `EXX2`) + `STANDARD` | ✅ broadcast pattern |
-| 3 | Two+ distinct non-STANDARD EAs | ❌ can't pair different permutations |
+| 3 | Two+ distinct non-STANDARD EAs | ❌ can't pair different permutations directly |
 | 4 | `EXX2` as the non-STANDARD EA | ❌ reduction mode, not an ordering |
+
+The predicate says which EAs can be used together as they are. Case 3, and the BAD
+case above, can still be compiled by rearranging one operand to match the other,
+which turns them into case 1. Whether to spend the traffic or raise `Unsupported`
+is a cost decision.
 
 ## Enforcement: `validate_ops`
 
@@ -177,15 +223,21 @@ An op not in the list receiving a FP32 input is a compile-time
 
 ## Completeness: what's missing
 
-Because FP32 is ephemeral, completeness is one question: are the brackets closed
-and enforced? Five gaps:
+> **This section may be out of date and needs a review.** Some of the gaps below
+> may have been closed since it was written.
 
-1. **Bracket-closure check (missing).** `validate_ops` is per-op; nothing verifies
-   *global* closure — that every upcast is matched by a downcast on all paths and
-   no staggered FP32 reaches a graph boundary unclosed. That is the invariant:
-   > A value an op cannot legally consume must raise a compile-time `Unsupported`,
-   > never a silent downcast; and no staggered FP32 may reach a graph boundary
-   > unclosed.
+The invariant to hold on to is:
+
+> A value an op cannot legally consume must raise a compile-time `Unsupported`,
+> never a silent downcast; and no staggered value may reach a graph boundary.
+
+Gaps:
+
+1. **Arrangement check at graph boundaries (missing).** `validate_ops` is per-op;
+   nothing checks globally that no staggered value escapes. With rearrangement
+   available, a path can be closed either by the downcast it already has or by an
+   inserted rearrangement, so the check has to decide which, but the invariant
+   it enforces is unchanged.
 2. **Flagship brackets.** `layernorm`/`softmax` still strip the up/downcasts and
    run 16-bit; removing the strip is the primary "turn on FP32" work.
 3. **RMSNorm.** Not enabled — open question whether it works via allowlisted
@@ -194,12 +246,16 @@ and enforced? Five gaps:
    re-accounts for padding. It handles trailing padding but bails (`return []`)
    when the tensor doesn't start on a stick boundary — an acceptable constraint,
    but the bail should be a hard-fail, not a silent drop.
-5. **Standalone eager conversion.** Eager `.to(fp32)` up/downcasts conversions not
-   ensure bracket-closure and not guaranteed to output standard FP32
+5. **Standalone eager conversion.** Eager `.to(fp32)` up/downcasts do not check
+   that no staggered value escapes, and are not guaranteed to produce standard
+   FP32. They can be made to: a rearrangement after the upcast gives standard
+   FP32. What is missing is the decision to spend the traffic, not the means.
 
-**Debug aid.** With no device-side un-stagger, inspection is host-side: copy the
-staggered FP32 to host verbatim and reverse the permutation there for golden
-comparison. It hard-codes the hardware permutation — debug-only, generation-aware.
+**Debug aid.** A staggered tensor can be inspected by rearranging it to standard
+on device and copying that. The older host-side route (copy the staggered tensor
+verbatim and undo the permutation on the host) still works and needs nothing from
+the device, but it hard-codes the hardware permutation and has to track hardware
+generations, where the device route reads the arrangement off the layout.
 
 ## Related Issues
 
