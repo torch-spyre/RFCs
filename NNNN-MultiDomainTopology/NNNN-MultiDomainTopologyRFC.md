@@ -28,6 +28,12 @@ runtime, torch-spyre validates the actual tensor arguments, resolves their live
 per-endpoint addresses in that order, and supplies those values to the
 DeepTools-generated correction mechanism before launch.
 
+The Inductor frontend keeps its existing operation. The multi-domain additions
+are additive and localized to the final phase that produces the SuperDSC and
+SuperDSC-Bundle description, so the substantial new work this contract requires
+falls on the DeepTools backend: preserving the compile-time interface and
+generating the host-side program correction.
+
 The design separates five concerns:
 
 1. PyTorch-compatible shard intent and global tensor semantics;
@@ -100,6 +106,37 @@ model:
 An explicit cross-layer contract is therefore required. Inferring shard identity
 from chunk order, HBM group number, or endpoint number would be fragile under
 allocator reordering, topology changes, and core sparing.
+
+## Rationale
+
+Intra-device tensor parallelism is the model that matches this hardware. The
+target exposes several internal memory and compute localities inside one
+accelerator, so using its aggregate HBM capacity and compute bandwidth for a
+single large tensor requires partitioning that tensor's storage and the
+operator's work across those localities. Partitioning a tensor and its operator
+across localities is exactly what tensor parallelism (TP) expresses.
+
+- Data parallelism replicates parameters and partitions the batch; it does not
+  let one tensor exceed a single locality's capacity and would duplicate, not
+  distribute, storage.
+- Pipeline parallelism partitions across layers in time; it does not address
+  per-tensor capacity or bandwidth within one operation.
+- A single unified allocation spanning all groups is not guaranteed by any
+  current contract — there is no linear DVA across the eight logical HBM groups
+  (see **Alternatives**), so multi-group memory cannot be used safely without
+  explicit per-group placement.
+
+TP's `Shard`, `Replicate`, and `Partial` vocabulary and its local-shape
+derivation already model "one logical tensor whose elements are distributed
+across localities," and give a proven partitioning contract plus a clear path to
+future cross-shard reductions and redistribution. This RFC therefore borrows
+TP's partitioning semantics while deliberately keeping execution **intra-device
+and single-process**: it uses `Shard(dim)` intent and local-shape math, but not
+a `DeviceMesh`, ranks, a process group, or collectives. The result keeps the
+one-tensor user model and familiar sharding intent while avoiding the cost and
+failure modes of a distributed runtime. The negative case against the specific
+distributed alternatives — native DTensor, eight devices, and a Python list of
+shards — appears in **Alternatives**.
 
 ## Goals and non-goals
 
@@ -207,8 +244,9 @@ The ownership boundaries are normative:
   evidence of what was allocated.
 - **Senlib and qualified target data** provide topology and address-translation
   facts.
-- **DeepTools** owns final generated-program structure and final per-HCM symbol
-  order.
+- **DeepTools** owns final generated-program structure, final per-HCM symbol
+  order, and the host-side program-correction mechanism (see **Required
+  DeepTools work**).
 - **The runtime** resolves live allocations against the final manifest and
   submits work.
 
@@ -364,6 +402,20 @@ produce shard-local iteration spaces only after proving that:
 - broadcasting does not cross shard boundaries;
 - all shard-local layouts and work divisions are valid; and
 - output placement is known before allocation.
+
+### Compiler frontend impact
+
+The Inductor frontend does not change its operational model. How it recognizes,
+schedules, tiles, and lowers operations is unchanged, and, as in **Pointwise
+execution**, it derives shard-local iteration spaces in Spyre-private lowering
+only after the placement-match proof succeeds. The multi-domain work in the
+frontend is additive and confined to the final phase that emits the SuperDSC
+JSON and SuperDSC-Bundle MLIR: it sets `nonUnifiedAllocInHBM_` and
+`isStartAddrSymbolic_`, records the topology-selected endpoints and their work
+slices, emits one symbolic start per endpoint, and attaches the opaque
+per-binding metadata. No earlier pass or intermediate graph representation is
+redesigned. Consequently, the substantial new implementation work for this
+contract falls on the DeepTools backend, described next.
 
 ### Compile-time and runtime DeepTools contract
 
@@ -528,17 +580,24 @@ local data stages, layout coordinates, endpoint work slices, address symbols,
 bundle operands, final correction-input manifests, and runtime bindings must
 describe the same execution.
 
-#### Required DeepTools support
+#### Required DeepTools work (interface and host-side program correction)
 
-This RFC specifically asks DeepTools to define and support the following
-behavior:
+This is the concrete work requested from the DeepTools team. It has two parts:
+the compile-time interface DeepTools must accept and preserve, and the host-side
+program-correction mechanism DeepTools must generate and expose to the runtime.
+
+**Part 1 — Compile-time interface DeepTools must accept and preserve:**
 
 1. accept the multi-domain SuperDSC fields and non-unified allocation semantics
-   defined above;
+   defined above; and
 2. preserve the association among endpoint, tensor start symbol, and opaque
-   Inductor binding key even if compilation reorders or duplicates symbols;
-3. generate `SpyreCode` containing the program-correction mechanism required to
-   substitute symbolic starts before execution;
+   Inductor binding key through parsing, allocation reconstruction, semantic
+   hashing, and lowering, even if compilation reorders or duplicates symbols.
+
+**Part 2 — Host-side program correction DeepTools must generate:**
+
+3. generate `SpyreCode` containing the host-side program-correction mechanism
+   required to substitute symbolic starts before execution;
 4. emit a versioned final per-HCM correction-input manifest after all DeepTools
    transformations, including the exact input order and count expected by that
    mechanism; and
