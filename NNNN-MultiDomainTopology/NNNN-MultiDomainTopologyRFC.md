@@ -16,7 +16,7 @@ The user continues to interact with one ordinary, global-shape tensor on
 `spyre:0`. Internally, torch-spyre partitions its storage into eight semantic
 shards, allocates each shard in a logical HBM group, and executes one pointwise
 replica per shard. The initial correctness milestone supports blocking host
-migration and same-placement pointwise `torch.add` through one explicit
+migration and same-placement pointwise operations through one explicit
 32-endpoint program.
 
 A central purpose of this RFC is to define the DeepTools contract needed to
@@ -92,11 +92,11 @@ Existing components provide useful primitives but not the complete semantic
 model:
 
 - torch-spyre represents Spyre as one PrivateUse1 device and now has a landed
-  semantic sharding slice (`distribute_tensor`/`full_tensor`, a
-  torch-spyre-owned shard table, segment-emulated receipts, and same-placement
-  pointwise `add`), but that slice
-  allocates through the single-domain segment-emulated path and does not yet
-  place shards in explicit logical HBM groups;
+  semantic sharding slice (`to_sharded` with `.cpu()` gather, a
+  torch-spyre-owned shard table, per-shard allocations bound round-robin to
+  Flex memory domains, and same-placement pointwise ops), but that slice
+  does not yet place shards through an explicit qualified
+  `MultiDomainTopology` mapping;
 - Flex can represent multiple chunks in a `CompositeAddress`, but the production
   path does not yet provide the explicit eight-group allocation and immutable
   semantic receipt required here;
@@ -191,14 +191,14 @@ c10d initialization, or distributed runtime. Public TP placement values are
 inputs to torch-spyre planning, not a dependency on distributed execution.
 
 Rollout begins with the explicit blocking API
-`torch.spyre.distribute_tensor()`:
+`torch.spyre.to_sharded()`:
 
 ```python
 from torch.distributed.tensor import Shard
 
-x = torch.spyre.distribute_tensor(x_cpu, Shard(0))
+x = torch.spyre.to_sharded(x_cpu, Shard(0))
 z = torch.add(x, x)                     # compiled sharded pointwise
-x_cpu = torch.spyre.full_tensor(x)      # gather; .to("cpu")/.cpu() equivalent
+x_cpu = x.cpu()                         # gather; .to("cpu") equivalent
 
 torch.spyre.is_sharded(x)               # True
 info = torch.spyre.sharding_info(x)     # placement, num_shards, receipt
@@ -207,14 +207,13 @@ info = torch.spyre.sharding_info(x)     # placement, num_shards, receipt
 The full signature is:
 
 ```python
-torch.spyre.distribute_tensor(
+torch.spyre.to_sharded(
     tensor,                             # CPU source tensor
     placement,                          # Shard(dim) or [Shard(dim)]
     *,
     num_shards: int | None = None,      # default: active core count
 ) -> torch.Tensor                       # global-shape tensor on spyre:0
 
-torch.spyre.full_tensor(tensor) -> torch.Tensor
 torch.spyre.is_sharded(tensor) -> bool
 torch.spyre.sharding_info(tensor) -> ShardedTensorInfo
 ```
@@ -225,14 +224,15 @@ The API is designed so a PyTorch Tensor Parallel user recognizes every token
 of the calling pattern, while nothing is promised that intra-device sharding
 cannot deliver. The decisions, and why:
 
-- **The name is `distribute_tensor`, the exact TP entry-point name.** A TP
-  user porting `distribute_tensor(x, mesh, [Shard(0)])` finds the spyre
-  equivalent by name, and the argument order `(tensor, placement)` mirrors
-  TP's `(input, mesh, placements)` with the mesh slot removed. The name is
-  also placement-union-neutral: it stays correct when `Replicate`-style
-  placements are admitted later, which a name like `to_sharded` would not —
-  one cannot "shard" a tensor into replicas. `to_sharded` was rejected on
-  exactly this ground.
+- **The name is `to_sharded`, not the TP entry-point name.** Reusing
+  `distribute_tensor` was rejected: upstream `torch.distributed.tensor`
+  already owns that name and returns a `DTensor`, while this API returns a
+  plain `torch.Tensor` — the same name with a different return type invites
+  exactly the confusion the fail-closed design works to prevent, and blocks
+  forward-compatible convergence if the two ever meet. `to_sharded` instead
+  follows the `to_sparse` / `to_mkldnn` family — a plain tensor whose
+  storage layout changed — and stays placement-union-neutral for a future
+  `Replicate`-style admission the same way those do.
 - **No mesh is exposed.** In TP, `DeviceMesh` names a set of communicating
   ranks that collectives route over and that the user owns. This target has
   one process, no ranks, and no collectives; the shard count is a hardware
@@ -244,20 +244,24 @@ cannot deliver. The decisions, and why:
   Summary already rules out a distributed `DeviceMesh`; the API follows.
 - **`num_shards` defaults to the active core count.** TP users never state
   the shard count; the mesh owns it. The intra-device equivalent resolves
-  the count from the device at call time. An explicit value remains
-  admitted and cross-checked against the topology (fail-closed), and the
-  parameter is kept because a future stack-balanced four-shard placement
-  will need it. A fixed default such as `8` was rejected: it looks like a
-  free parameter and is silently wrong whenever the active core count
-  differs.
+  the count from the device at call time and requires it to equal the
+  active core count (`SENCORES`), so storage and the kernels that consume
+  it agree on how many cores participate. An explicit value is admitted and
+  cross-checked against the topology (fail-closed), and the parameter is
+  kept because a future stack-balanced four-shard placement will need it. A
+  fixed default such as `8` was rejected: it looks like a free parameter
+  and is silently wrong whenever the active core count differs.
 - **`placement` accepts `Shard(dim)` or `[Shard(dim)]`.** TP users type the
   list form by muscle memory, so it is accepted and normalized; exactly one
   placement is admitted because there is no multi-dimensional mesh. The
   parameter name stays singular — a plural `placements` would promise
   one-per-mesh-dim semantics the device cannot honor.
-- **`full_tensor` mirrors `DTensor.full_tensor()`** for the gather, so the
-  TP vocabulary round-trips end to end; `.to("cpu")` and `.cpu()` remain
-  equivalent spellings.
+- **There is no `full_tensor()`; the gather is `.cpu()` / `.to("cpu")`.** A
+  `full_tensor()` mirroring `DTensor.full_tensor()` was tried and dropped:
+  it duplicated the standard copy spellings while promising DTensor-family
+  semantics (autograd through the gather, redistribution) that do not
+  exist. The plain copy methods are the honest spellings for a plain
+  tensor.
 - **`is_sharded(tensor)` follows PyTorch's own predicate pattern.** TP users
   check `isinstance(x, DTensor)`, which works there because DTensor is a
   subclass; this API deliberately returns a plain `torch.Tensor`, so
@@ -284,7 +288,7 @@ cannot deliver. The decisions, and why:
   view that compiled kernels must reject (a consumer would address one
   chunk through a single base), so exposing one would undercut the
   fail-closed rule. Shard-local data is reachable only through the explicit
-  gather (`full_tensor`), never as an addressable view.
+  gather (`.cpu()`), never as an addressable view.
 - **The divergence is documented at the point of use.** The docstring
   states plainly that the result is a plain `torch.Tensor` — no DTensor, no
   mesh, no collectives, no autograd, equal shards only. The fail-closed
@@ -294,10 +298,12 @@ cannot deliver. The decisions, and why:
   named error, never a wrong result.
 
 The torch-spyre side of this API (validation, equal-shard planning, the
-torch-spyre-owned shard table, segment-emulated receipts, and
-same-placement pointwise `add` with launch-time shard-address resolution)
-is implemented today; the native multi-domain allocation, topology, and
-DeepTools contract below remain proposed.
+torch-spyre-owned shard table in `ShardedStorageInfo`, per-shard
+allocations bound round-robin to Flex memory domains, and same-placement
+pointwise ops with launch-time shard-address resolution) is implemented
+today; the explicit qualified-topology placement, the full
+`MultiDomainTopology` contract, and the DeepTools manifest interface below
+remain proposed.
 
 After native allocation, migration, error handling, and pointwise execution are
 qualified, an opt-in policy may route eligible `.to("spyre")` calls through the
@@ -309,7 +315,9 @@ tensor name, shape, or future use. A documented policy may eventually select a
 default such as `Shard(0)`; other dimensions require explicit intent.
 
 The initial path accepts only static, contiguous, non-aliased base tensors with
-zero storage offset, exactly eight equal non-empty shards, supported dtype and
+zero storage offset, an exact equal split into `num_shards` shards (the
+shard count equals the active core count; the qualified profile's eight
+logical HBM groups correspond to eight shards), supported dtype and
 memory format, and a valid local Spyre layout for every shard. Explicit sharding
 fails when these conditions are not met. A transparent policy may use unified
 storage only when that fallback is explicitly configured and diagnosed.
@@ -497,7 +505,9 @@ translation state, and completion objects for the full asynchronous lifetime.
 
 ### Pointwise execution
 
-The first required operation is same-shape binary `torch.add`:
+The first required operations are same-shape pointwise ops (any op whose
+operands and output share one shape; `add` is the operation the test suite
+pins, and the compiler's op-kind check is generic):
 
 ```text
 Shard(d), Shard(d) -> Shard(d)
@@ -833,7 +843,9 @@ Phase 1 is successful when:
 - blocking H2D/D2H round trips reproduce CPU values at every shard boundary;
 - all eight allocations are verified in their requested logical HBM groups on
   the initial native multi-domain target;
-- `torch.add` covers every shard exactly once and matches CPU results;
+- the pinned pointwise operation (`torch.add`) covers every shard exactly
+  once and matches CPU results, and other admitted same-shape pointwise ops
+  follow the same one-replica-per-shard contract;
 - the explicit program uses all 32 healthy endpoints under the qualified
   `MultiDomainTopology`;
 - binary add receives exactly 96 validated runtime bindings in final manifest
@@ -946,11 +958,11 @@ distinct from rank-local distributed storage.
 Existing torch-spyre experimental work on interleaved HBM placement established
 a separation between logical tensor properties and physical HBM placement. The
 landed sharded-tensor slice extends that principle
-to semantic shards: `torch.spyre.distribute_tensor(x, Shard(dim))` with a
+to semantic shards: `torch.spyre.to_sharded(x, Shard(dim))` with a
 torch-spyre-owned shard table, validated generation-neutral placement receipts,
-and one compiled pointwise op whose per-endpoint start addresses stay symbolic
+and compiled pointwise ops whose per-endpoint start addresses stay symbolic
 until launch — the intra-device, single-process TP model this RFC generalizes
-from eight segment-emulated chunks to eight logical HBM groups and 32
+from per-shard Flex-domain allocations to eight logical HBM groups and 32
 endpoints. This proposal extends that slice with explicit multi-group
 placement, the `MultiDomainTopology` contract, and the DeepTools
 program-correction interface. That work is
@@ -1033,7 +1045,7 @@ program correctly.
    compute submission?
 
 A read-only public placement-inspection API is useful for diagnostics but does
-not block the `torch.spyre.distribute_tensor()` constructor (landed as
+not block the `torch.spyre.to_sharded()` constructor (landed as
 `torch.spyre.sharding_info()`). Its design is deferred until the placement
 and receipt contracts are stable.
 
