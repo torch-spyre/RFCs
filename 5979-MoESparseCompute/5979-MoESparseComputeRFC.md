@@ -80,7 +80,7 @@ The router turns the dense `[Tq,E]` routing weights into per-expert packed token
 
 Input: `x : [Tq, dmodel]`, stick dim `dmodel`
 
-Constant: `tok_ids : [Tq]` = `0 .. Tq-1`, precomputed. Feeds the token-id scatter (A16b) directly and is the same for every expert
+Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id scatter (A16b) directly and is the same for every expert
 
 **Router**
 
@@ -98,17 +98,17 @@ Constant: `tok_ids : [Tq]` = `0 .. Tq-1`, precomputed. Feeds the token-id scatte
 | A10 | `unstagger_stick_ea` | `[Tq,E]` (A9) | `score [Tq, E]` | fp32 | `E` (32) | restores contiguous `E` order |
 | A11 | `non_zero_pos_to_idx` (dim=Tq) **[NEW]** | `score[Tq,E]` (A10) | a) `run_pos [Tq, E]`<br>b) `cnt [1, E]` | fp32 | `E` (32) | scans **across** sticks along `Tq`, independently per `E` lane. a) non-zero entry → number of non-zeros before it in this `E` column (its slot in the expert's list); zero entry → dummy location `Tq` (the `(Tq+1)`-th row). b) non-zeros per expert = `cnt[e]` |
 | A12 | `round_up` (to G) | `cnt[1,E]` (A11b) | `cnt_r [1, E]` | fp32 | `E` (32) | `cnt_r[e] = max(G, ⌈cnt[e]/G⌉·G)`. **0 rounds to `G`**, so `nc[e] = cnt_r[e]/G ≥ 1` |
-| A13 | `idx2Addr` | `run_pos[Tq,E]` (A11a) | `run_addr [Tq, E]` | int32 | `E` (32) | slot → address in the `[Tq+1,E,32]` scatter destination (A15). Fed to the A16 scatters as is, with no dummy dim |
+| A13 | `idx2Addr` | `run_pos[Tq,E]` (A11a) | `run_addr [Tq, E]` | int32 | `E` (32) | slot → address in the `[Tq+1,E,32]` scatter destination (A15). Fed to the A16 scatters as is, with no dummy dim. Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
 | A14a | `restickify` | `score[Tq,E]` (A10) | `[Tq, E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per (token, expert) entry |
 | A14b | `restickify` | `cnt_r[1,E]` (A12) | `[1, E, 32]` | fp32 | dummy (32) | one stick per expert; source of the `nc[e]` loop bound |
-| A15 | `init` (fill = `Tq`) | — | `[Tq+1, E, 32]` | fp32 | dummy (32) | every entry points at the dummy pad token (row `Tq` of `x_pad`, A19). Initial destination for A16a and A16b (one copy each) |
+| A15 | `init` (fill = `Tq`) | — | `[Tq+1, E, 32]` | fp32 / int32 | dummy (32) | every entry points at the dummy pad token (row `Tq` of `x_pad`, A19). Initial destination for A16a (fp32 copy) and A16b (int32 copy) |
 | A16a | `scatter` (score) | `[Tq,E,32]` (A14a), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | fp32 | dummy (32) | entry `(t,e)` → row `run_pos[t,e]`, expert `e`. Zero entries all land in dummy row `Tq` |
-| A16b | `scatter` (token id) | `tok_ids[Tq]` (constant), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | fp32 | dummy (32) | entry `(t,e)` writes token id `t` to row `run_pos[t,e]`, expert `e`; the same `tok_ids` is used for every `e`. **Slowest op:** each scatter is `Tq·E·128 B` = 128 MB at `E = 128`, ~256 MB for A16a+A16b ⇒ can take **~10+ ms**. WIP to optimize |
+| A16b | `scatter` (token id) | `tok_ids[Tq]` (constant), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | int32 | dummy (32) | entry `(t,e)` writes token id `t` to row `run_pos[t,e]`, expert `e`; the same `tok_ids` is used for every `e`. **Slowest op:** each scatter is `Tq·E·128 B` = 128 MB at `E = 128`, ~256 MB for A16a+A16b ⇒ can take **~10+ ms**. WIP to optimize |
 | A17a | `restickify` | `[Tq+1,E,32]` (A16a) | `w_list [Tq+1, E]` | fp32 | `Tq` | brings `Tq` into the stick, drops the dummy dim. Column `e` = weights in slot order |
-| A17b | `restickify` | `[Tq+1,E,32]` (A16b) | `tok_list [Tq+1, E]` | fp32 | `Tq` | as above. Column `e` = token ids routed to `e`, packed into slots `0..cnt[e]-1`; remaining slots = `Tq` (pad) |
+| A17b | `restickify` | `[Tq+1,E,32]` (A16b) | `tok_list [Tq+1, E]` | int32 | `Tq` | as above. Column `e` = token ids routed to `e`, packed into slots `0..cnt[e]-1`; remaining slots = `Tq` (pad) |
 | A18 | `zero_init` | — | `moe_out [Tq+1, dmodel]` | df16 | `dmodel` | partial-output space. Row `Tq` is a **sink** for dummy-slot writes |
 | A19 | `pad` | `x[Tq,dmodel]` (in) | `x_pad [Tq+1, dmodel]` | df16 | `dmodel` | appends 1 dummy token at row `Tq`, all zeros. Dummy slots of `w_list` keep the A15 fill value (`Tq`) rather than 0, so the pad token must be zero: the bias-free FFN then outputs 0 and the sink row stays finite |
-| A20 | `idx2Addr` (base = `x_pad`) | `tok_list[Tq+1,E]` (A17b) | `addr_in [Tq+1, E]` | int32 | `Tq` | token id → row address in `x_pad`. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
+| A20 | `idx2Addr` (base = `x_pad`) | `tok_list[Tq+1,E]` (A17b) | `addr_in [Tq+1, E]` | int32 | `Tq` | token id → row address in `x_pad`. int32 input |
 | A21 | `idx2Addr` (base = `moe_out`) | `tok_list[Tq+1,E]` (A17b) | `addr_out [Tq+1, E]` | int32 | `Tq` | token id → row address in `moe_out` |
 
 **Routed experts**
@@ -158,7 +158,7 @@ The router works out which experts at least one token picked (`is_any_non_zero`)
 
 Input: `x : [B, dmodel]`, stick dim `dmodel`
 
-Constant: `exp_ids : [E]` = `0 .. E-1`, precomputed. Feeds the expert-id scatter (B16) directly
+Constant: `exp_ids : [E]` int32 = `0 .. E-1`, precomputed. Feeds the expert-id scatter (B16) directly
 
 **Router**
 
@@ -177,10 +177,10 @@ Constant: `exp_ids : [E]` = `0 .. E-1`, precomputed. Feeds the expert-id scatter
 | B11 | `unstagger_stick_ea` | `[1,E]` (B10) | `[1, E]` | fp32 | `E` (32) | restores contiguous `E` order |
 | B12 | `restickify` | `[1,E]` (B11) | `[E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per expert |
 | B13 | `non_zero_pos_to_idx` (dim=E) **[NEW]** | `[E,32]` (B12) | a) `run_pos [E, 32]`<br>b) `E_sel [1, 32]` | fp32 | dummy (32) | same op as prefill A11, scanning along `E`. a) selected expert → its slot `j` among the selected experts; unselected → dummy location `E`. b) number of selected experts = `E_sel` |
-| B14 | `idx2Addr` | `run_pos[E,32]` (B13a) | `run_addr [E, 32]` | int32 | dummy (32) | slot → address in the `[E+1,32]` scatter destination (B15) |
-| B15 | `init` | — | `[E+1, 32]` | fp32 | dummy (32) | scatter destination. Row `E` is the sink for unselected experts. Slots `≥ E_sel` are never read by the loop, so the fill value doesn't matter |
-| B16 | `scatter` (expert id) | `exp_ids[E]` (constant), `run_addr` (B14), dest (B15) | `sel_list [E+1, 32]` | fp32 | dummy (32) | packs selected expert ids into slots `0..E_sel-1`. Only `E·128 B` = 16 KB at `E = 128` ⇒ cheap |
-| B17a | `idx2Addr` (base = `W_gate`) | `sel_list[E+1,32]` (B16) | `addr_gate [E+1, 32]` | int32 | dummy (32) | expert id → base address of that expert in `W_gate`; one address stick per slot. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
+| B14 | `idx2Addr` | `run_pos[E,32]` (B13a) | `run_addr [E, 32]` | int32 | dummy (32) | slot → address in the `[E+1,32]` scatter destination (B15). Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
+| B15 | `init` | — | `[E+1, 32]` | int32 | dummy (32) | scatter destination. Row `E` is the sink for unselected experts. Slots `≥ E_sel` are never read by the loop, so the fill value doesn't matter |
+| B16 | `scatter` (expert id) | `exp_ids[E]` (constant), `run_addr` (B14), dest (B15) | `sel_list [E+1, 32]` | int32 | dummy (32) | packs selected expert ids into slots `0..E_sel-1`. Only `E·128 B` = 16 KB at `E = 128` ⇒ cheap |
+| B17a | `idx2Addr` (base = `W_gate`) | `sel_list[E+1,32]` (B16) | `addr_gate [E+1, 32]` | int32 | dummy (32) | expert id → base address of that expert in `W_gate`; one address stick per slot. int32 input |
 | B17b | `idx2Addr` (base = `W_up`) | `sel_list[E+1,32]` (B16) | `addr_up [E+1, 32]` | int32 | dummy (32) | as above for `W_up` |
 | B17c | `idx2Addr` (base = `W_down`) | `sel_list[E+1,32]` (B16) | `addr_down [E+1, 32]` | int32 | dummy (32) | as above for `W_down` |
 | B17d | `idx2Addr` (base = `w_dense`) | `sel_list[E+1,32]` (B16) | `addr_w [E+1, 32]` | int32 | dummy (32) | expert id → address of column `e` of `w_dense[B,E]` (B7, stick dim `B`) — the `[B]` weights of all tokens for that expert |
@@ -226,7 +226,7 @@ The loop reads slots `j = 0 .. E_sel-1` of `addr_gate` / `addr_up` / `addr_down`
 3. `non_zero_pos_to_idx` (prefill A11, decode B13): **new op**. Two outputs: running position (with a dummy location `Tq` / `E` for zero entries) and count. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
 4. `round_up` (prefill A12): **new op**. Round to a multiple of `G`, with 0 → `G`.
 5. `is_any_non_zero` (decode B9): **new op**. Reduce across sticks to a 0/1 flag.
-6. `idx2Addr` (prefill A13, A20, A21; decode B14, B17a–d): accept fp32 input. It doesn't today.
+6. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). It doesn't today. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
 
 `df16tofp32` outputs are staggered along the stick; `unstagger_stick_ea` restores contiguous order (see [RFC 2971 — FP32 Element Arrangement](../2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md)).
 
