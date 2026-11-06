@@ -262,6 +262,9 @@ on each device d in parallel:
 4. `round_up` (prefill A12): **new op**. Round to a multiple of `G`, with 0 → `G`.
 5. `is_any_non_zero` (decode B9): **new op**. Reduce across sticks to a 0/1 flag.
 6. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). It doesn't today. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
+7. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A14b, decode expert loop `E_sel` from B13b):
+   - a) SDSCbundle interface: assign each loop the tensor address its loop count is read from
+   - b) Backend program looping where the loop count comes from a tensor read
 
 `df16tofp32` outputs are staggered along the stick; `unstagger_stick_ea` restores contiguous order (see [RFC 2971 — FP32 Element Arrangement](../2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md)).
 
