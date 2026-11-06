@@ -11,7 +11,7 @@ This RFC proposes sparse kernels for the MoE (sparse FFN) block on Spyre, using 
 * **Shared experts** run on all tokens in both phases.
 * The router needs three **new ops** (`non_zero_pos_to_idx`, `round_up`, `is_any_non_zero`) and changes to two existing ones.
 
-Multi-chip parallelization will be added in a later revision.
+Across devices, the block uses tensor parallelism: each device holds a `1/D` slice of every expert's intermediate dim, and an AllReduce at the end combines the partial outputs.
 
 ## **Motivation**
 
@@ -217,7 +217,42 @@ The loop reads slots `j = 0 .. E_sel-1` of `addr_gate` / `addr_up` / `addr_down`
 
 ### Multi-chip parallelization
 
-*To be updated soon.*
+**Strategy:** tensor parallelism (TP) across `D` devices (`D` = 4 or 8), with no expert parallelism. Every device holds a `1/D` slice of the intermediate dim of **every** expert, routed and shared:
+
+| Weight | Split | Per-device slice |
+|---|---|---|
+| `W_gate`, `W_up` `[E, dmodel, dff_e]` | columns of `dff_e` | `[E, dmodel, dff_e/D]` |
+| `W_down` `[E, dff_e, dmodel]` | rows of `dff_e` | `[E, dff_e/D, dmodel]` |
+| `W_gate_s`, `W_up_s` / `W_down_s` | `dff_s`, same way | `dff_s/D` |
+| `W_router` | replicated | `[dmodel, E]` |
+
+**Rationale:** `dff_e ≈ 2048`, so each device keeps `dff_e/D` = 512 (`D = 4`) or 256 (`D = 8`). That is still 4–8 full df16 sticks, enough for efficient GEMMs. Every device runs the same experts on the same tokens with the same slice size, so the work is **balanced by construction**. With expert parallelism, load would follow the routing distribution and the most-loaded device would set the latency.
+
+**Execution:**
+- `x` is replicated, and every device runs the full router (prefill A1–A21, decode B1–B17d) and gets identical routing.
+- Each device then runs the routed-expert and shared-expert loops on its slices. `idx2Addr` bases (`W_gate`, `W_up`, `W_down`) point at the device-local slices.
+- Each device's `down_proj` output is a partial sum over its `dff_e/D` slice. The routing-weight `mul` and the `gather`/`add`/`scatter` into `moe_out` are linear, so partial sums can accumulate locally.
+- A single **AllReduce** (sum over `D` devices) at the end of the MoE block combines routed and shared partials. It moves `[Tq, dmodel]` in prefill and `[B, dmodel]` in decode, df16.
+
+In the op tables, read `dff_e` / `dff_s` as `dff_e/D` / `dff_s/D` per device.
+
+**Pseudocode:**
+
+```python
+# D devices; device d holds slice F_d = [d*dff_e/D, (d+1)*dff_e/D) of every expert
+# (and the matching dff_s/D slice of each shared expert)
+on each device d in parallel:
+    route = router(x)                        # replicated: same result on every device
+    out_d = zeros(T, dmodel)                 # T = Tq (prefill) or B (decode)
+    for e in experts(route):                 # prefill: all E, nc[e] tiles; decode: E_sel
+        t, w = tokens(route, e), weights(route, e)
+        h = silu(x[t] @ W_gate[e][:, F_d]) * (x[t] @ W_up[e][:, F_d])   # [|t|, dff_e/D]
+        out_d[t] += w * (h @ W_down[e][F_d, :])                         # partial over F_d
+    for s in range(Es):
+        h = silu(x @ W_gate_s[s][:, Fs_d]) * (x @ W_up_s[s][:, Fs_d])
+        out_d += h @ W_down_s[s][Fs_d, :]
+    y = all_reduce_sum(out_d)                # one collective per MoE block
+```
 
 ### New and modified ops
 
@@ -254,7 +289,6 @@ The prefill structure follows the usual sparse-MoE kernel pattern of per-expert 
 ## **Unresolved questions**
 
 * How to optimize the prefill router scatters (A16a/b).
-* Multi-chip parallelization (to be added).
 
 ## Resolution
 
