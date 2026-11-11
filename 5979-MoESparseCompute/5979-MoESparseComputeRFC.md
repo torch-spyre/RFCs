@@ -90,7 +90,7 @@ Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id 
 | A2 | `softmax` (dim=E) | `[Tq,E]` (A1) | `[Tq, E]` | df16 | `E` | reduces **along** the stick dim |
 | A3 | `restickify` | `[Tq,E]` (A2) | `[Tq, E]` | df16 | `Tq` | stick dim `E`→`Tq`; moves the selection/reduction axis `E` off the stick |
 | A4 | `topk_idx` (K=8, dim=E) | `[Tq,E]` (A3) | `idx [Tq,K]` | df16 | `Tq` | index output only; selects **across** sticks. Exact in df16 (`E = 128` needs 7 bits) |
-| A5 | `mask_by_index` | `[Tq,E]` (A3), `idx[Tq,K]` (A4) | `[Tq, E]` | df16 | `Tq` | non-top-K scores → 0. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
+| A5 | `keep_by_index` | `[Tq,E]` (A3), `idx[Tq,K]` (A4) | `[Tq, E]` | df16 | `Tq` | keeps the top-K scores, others → 0 |
 | A6 | `sum_nonstick` (dim=E) | `[Tq,E]` (A5) | `[Tq, 1]` | df16 | `Tq` | renormalize denominator |
 | A7 | `realdiv` | `[Tq,E]` (A5) ÷ `[Tq,1]` (A6) | `[Tq, E]` | df16 | `Tq` | renormalized routing weights |
 | A8 | `restickify` | `[Tq,E]` (A7) | `[Tq, E]` | df16 | `E` | stick dim `Tq`→`E`; brings `E` back into the stick |
@@ -168,7 +168,7 @@ Constant: `exp_ids : [E]` int32 = `0 .. E-1`, precomputed. Feeds the expert-id s
 | B2 | `softmax` (dim=E) | `[B,E]` (B1) | `[B, E]` | df16 | `E` | reduces **along** the stick dim |
 | B3 | `restickify` | `[B,E]` (B2) | `[B, E]` | df16 | `B` | stick dim `E`→`B`. `B ≤ 32` ⇒ partial sticks whenever `S > B` |
 | B4 | `topk_index` (K=8, dim=E) | `[B,E]` (B3) | `idx [B,K]` | df16 | `B` | exact in df16 |
-| B5 | `mask_by_index` | `[B,E]` (B3), `idx[B,K]` (B4) | `[B, E]` | df16 | `B` | non-top-K scores → 0 (same as prefill A5). **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
+| B5 | `keep_by_index` | `[B,E]` (B3), `idx[B,K]` (B4) | `[B, E]` | df16 | `B` | keeps the top-K scores, others → 0 (same as prefill A5) |
 | B6 | `sum_nonstick` (dim=E) | `[B,E]` (B5) | `[B, 1]` | df16 | `B` | renormalize denominator |
 | B7 | `realdiv` | `[B,E]` (B5) ÷ `[B,1]` (B6) | `w_dense [B, E]` | df16 | `B` | renormalized routing weights; 0 where token `b` didn't pick expert `e` |
 | B8 | `restickify` | `w_dense[B,E]` (B7) | `[B, E]` | df16 | `E` | stick dim `B`→`E`; df16 restickify keeps `E` contiguous (no stagger) |
@@ -257,12 +257,11 @@ on each device d in parallel:
 
 ### New and modified ops
 
-1. `mask_by_index` (prefill A5, decode B5): mask the elements **not** in the index list.
-2. Matmul (decode B19, B20, B23): indirect access into the weight tensor; a `[B × dmodel]` GEMM rather than a GEMV.
-3. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location `Tq` / `E` for zero entries. The op interface specifies a single scan dimension. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
-4. `count_non_zero_round_up` (prefill A12, decode B13b): **new op**. Count non-zeros along the scan dimension and round up to a multiple of `G`, with 0 → `G`. Decode uses `G = 1`.
-5. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). It doesn't today. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
-6. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A14b, decode expert loop `E_sel` from B13b):
+1. Matmul (decode B19, B20, B23): indirect access into the weight tensor; a `[B × dmodel]` GEMM rather than a GEMV.
+2. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location `Tq` / `E` for zero entries. The op interface specifies a single scan dimension. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
+3. `count_non_zero_round_up` (prefill A12, decode B13b): **new op**. Count non-zeros along the scan dimension and round up to a multiple of `G`, with 0 → `G`. Decode uses `G = 1`.
+4. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). It doesn't today. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
+5. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A14b, decode expert loop `E_sel` from B13b):
    - a) SDSCbundle interface: assign each loop the tensor address its loop count is read from
    - b) Backend program looping where the loop count comes from a tensor read
 
