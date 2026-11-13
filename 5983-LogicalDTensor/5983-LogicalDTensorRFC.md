@@ -5,7 +5,7 @@
 * Joshua Rosenkranz (@JRosenkranz)
 * Tuan Hoang Trong (@thoangtrvn)
 
-**Status:** Draft for discussion in torch-spyre/RFCs, 2026-11-03.
+**Status:** Draft for discussion in torch-spyre/RFCs, 2026-11-13.
 
 ## **Summary**
 
@@ -189,6 +189,11 @@ remain correct. Merely reusing a group for several buffers does not establish
 collective matching. Local HBM coordinates do not require extra process ranks
 or independent process groups.
 
+These requirements also apply after compiler transformations. Lowering, fusion
+and transport batching must preserve the logical participant sets, matching
+identity, component order and producer-to-consumer dependencies of the selected
+execution plan.
+
 Composition also requires explicit dependencies between local and distributed
 stages. A transport operation must not read unfinished local results, and a
 local consumer must not read an incomplete received result. The execution
@@ -239,6 +244,12 @@ must not require a Python loop that invokes every operator separately for each
 coordinate. A backend may compile the global operation and its placement into a
 single execution plan with explicit local work slices.
 
+For compiled execution, this requires visibility of the relevant locally owned
+component computations and their redistribution dependencies within one
+compilation scope. The operator-propagation and compilation section defines the
+proposed representation and the point at which backend lowering selects its
+realization.
+
 Blocking completion does not by itself establish producer-to-consumer memory
 visibility. The executor must enforce the ordering and visibility needed by its
 local operations and redistributions. On failure, it must not expose a partial
@@ -259,6 +270,72 @@ coordinate.
 
 ### Operator propagation and compilation
 
+Ordinary compiled DTensor execution evaluates placement propagation and dispatch
+during tracing, exposing local tensor computation and required redistribution
+operations to the compiler. DTensor metadata supports reconstruction and
+compatibility checks; the compiler need not optimize the Python DTensor wrapper
+itself. This proposal extends the meaning of locally owned computation from one
+coordinate to every coordinate owned by the process.
+
+The proposed initial compiler representation contains ordinary tensor operations
+on the locally owned components, together with explicit semantic redistribution
+operations. A supported compiled region contains all relevant local components
+in one compilation scope. For a wholly local eight-coordinate mesh, that scope
+includes computation over all eight components. A hierarchical process
+contributes the components it owns and the communication operations connecting
+them to other processes; compilation need not encompass every process.
+
+Conceptually, the compilation path is:
+
+```text
+DTensor program and logical placements
+  -> placement propagation and executor-capability checks
+  -> traceable local components and axis-specific redistributions
+  -> captured functional graph, through AOT tracing where applicable
+  -> Inductor/backend lowering and scheduling
+  -> runtime bindings, execution and completion
+```
+
+Each component has its own local logical shape and stride. Capture retains the
+association between component values, coordinates, logical ranges and placements,
+together with the information needed to reconstruct the resulting DTensor.
+Backend layout and locality constraints that affect code generation must survive
+optimization. A backend may retain aggregate runtime storage, but the compiler
+must have equivalent visibility of its components and relationships. This
+representation does not require a Python launch per coordinate or independent
+physical allocations for every graph value.
+
+A traceable multi-component payload is one candidate implementation. Its abstract
+shape behavior, flattening and reconstruction must integrate with Dynamo and AOT
+tracing. Any new redistribution operation needs an abstract implementation and a
+supported decomposition or backend lowering. Calling an opaque Python executor
+during tracing, or retaining the only copy of placement information on a wrapper
+that tracing removes, is insufficient. The precise representation and
+registration points require agreement with DTensor and compiler maintainers.
+
+Redistributions retain their semantic axis, participant coordinates, source and
+destination placements, and reduction operation until an appropriate lowering
+selects their realization. Local HBM redistribution uses the local executor. A
+distributed-axis operation uses its communication executor with consistent
+matching and component order. Existing c10d operations do not automatically
+acquire local-HBM semantics when supplied with a different mesh.
+
+Lowerings must describe buffer reads and writes, aliases, communication effects
+and completion dependencies accurately. Compiler scheduling and memory reuse
+must preserve those dependencies. Distributed collectives cannot be removed or
+reordered independently across processes in a way that breaks matching. Local
+transformations may be optimized as ordinary tensor operations when their value,
+placement, alias and visibility requirements remain satisfied. Shared backing for
+replicas requires the declared access and mutation semantics.
+
+Spyre lowering may jointly optimize component computation and local
+redistribution and emit one or several device programs. Multiple component
+operations in the captured graph do not prescribe multiple kernel launches.
+Local operation boundaries may be decomposed or fused once the selected lowering
+preserves their semantics. Coarse opaque backend regions remain an alternative,
+with the explicit tradeoff that Inductor cannot optimize computation hidden
+inside them.
+
 Reuse the existing placement strategies and tensor metadata machinery where
 applicable. Refactor assumptions that derive one local shape from the current
 rank so they instead use explicit coordinates and execution ownership. Factory
@@ -269,19 +346,50 @@ Strategy selection must filter candidates through the executor's supported
 operations and placement transitions before considering their costs. The
 mathematical strategy definitions remain shared; backend capability and cost
 policies determine which realizations are feasible. If none is supported, reject
-the operation before allocation, redistribution, or kernel submission.
+the operation during planning or compilation before attempting its allocation,
+redistribution, or kernel submission.
 
 Normal DTensor dispatch includes a C++ path. Both that path and Python fallback
 handling must select the appropriate execution context and preserve the same
 placement semantics. A Python dispatcher patch alone is not a complete design.
 
-Compilation should capture global metadata, placement, and the code-affecting
-execution contract. Concrete allocation addresses and transient runtime handles
-must remain runtime inputs. A backend may require compatibility checks for local
-encoding, topology, or endpoint mappings without making live addresses part of
-the compiled artifact's identity. Redistribution cost estimates must come from a
-compatible backend policy rather than assuming GPU/NCCL costs apply to local HBM
-operations.
+Abstract evaluation and compatibility checking must work without initializing
+c10d or an accelerator runtime. Global and local geometry, placements,
+ownership, and code-affecting backend execution or layout assumptions participate
+in compilation compatibility. This may include local encoding, topology or
+endpoint mappings. Concrete allocation addresses and transient runtime handles
+remain runtime bindings. Rebinding compatible storage must not require
+recompiling solely because its addresses changed. Redistribution cost estimates
+must come from a compatible backend policy rather than assuming GPU/NCCL costs
+apply to local HBM operations.
+
+### Example of the compiler-visible computation
+
+Consider the wholly local example with a global `[1024, 64]` tensor sharded on
+dimension zero over eight HBM coordinates. Each coordinate owns a local logical
+`[128, 64]` component. The table describes the proposed graph semantics, not new
+public operator names.
+
+| Source operation | Computation represented in the captured region | Result placement |
+| --- | --- | --- |
+| `y = x + x` | Eight component additions; all are visible to the local backend together. | `Shard(0)` |
+| `p = y.sum(dim=0)` | Eight component reductions, each producing a `[64]` contribution. | `Partial(sum)` |
+| `p.redistribute(placements=[Replicate()])` | An HBM-axis combine of the eight contributions, making the complete value observable at every coordinate. | `Replicate()` |
+
+A CPU reference can lower the combine to ordinary reductions and copies. Spyre
+can lower the same semantics into a joint execution plan with its own local
+encoding, endpoint work and required visibility operations. Four endpoints
+serving one coordinate do not become four additional DTensor participants. A
+result stored at one HBM group meets `Replicate` only if every coordinate has the
+required access through copies or a supported shared representation.
+
+In the hierarchical `(tp, hbm)` example, process `t` captures its eight `(t, h)`
+components. A TP-axis operation combines the corresponding components across
+devices while holding `h` fixed. The compiled plan preserves participant
+identity, component order and dependencies between local and distributed stages.
+Packing several components into a transport operation is permitted only when
+their logical ranges and matching remain intact. A subsequent TP combine must
+not count HBM replicas as additional contributions.
 
 ### Backend responsibilities and the Spyre use case
 
@@ -357,6 +465,14 @@ endpoints as additional reduction contributions.
 
 Evaluate eager and compiled execution against the CPU reference, including
 gathered results and complete values observed at every replicated coordinate.
+
+Establish compiled execution through an actual Inductor lowering, alongside
+comparison with the eager reference. Successful tracing with an eager compiler
+backend establishes capture support but does not demonstrate Inductor scheduling,
+local redistribution lowering or native execution. Before declaring a compiled
+scope supported, inspect the resulting graph and execution plan for the intended
+component coverage, axis-specific redistribution and dependency structure.
+
 Hardware evaluation should compare the executor with the backend's existing
 sharding implementation using matched shapes, dtypes, layouts, topology, and
 execution settings. This RFC makes no measured performance claim; native Spyre
@@ -404,6 +520,29 @@ contract is debugging/simulation; it retains fake process-group metadata and
 patches rank/coordinate behavior. Its implementation is useful prior art, but a
 supported execution contract should be deliberate rather than inherited from
 testing machinery.
+
+**Use one process per memory locality.** This aligns each coordinate with
+DTensor's existing rank-local tensor model and can simplify reuse of current
+tracing, shape propagation and compiler lowering. For Spyre, it requires
+qualifying and coordinating several processes sharing one accelerator,
+including device ownership, placement and allocation accounting, submission
+ordering, cross-locality movement, and lifetime and failure handling. Joint
+optimization across the localities would also need coordination across their
+compilation scopes. This shifts complexity from compiler capture into the
+backend/runtime and does not meet the proposed wholly local single-process
+requirement. It remains an alternative to evaluate for backends whose resource
+and process models support it.
+
+**Use virtual-rank specialization during capture.** Specializing or tracing a
+local computation for different logical coordinates could reuse parts of
+rank-oriented DTensor tracing without creating extra operating-system processes.
+It still needs to produce a coherent graph or execution plan for all locally
+owned coordinates, preserving their geometry, aliases and redistribution
+dependencies. Simulated rank metadata does not itself provide local execution or
+collective matching. This could be an internal capture technique if its output
+meets the compiler contract above. Existing `compile_on_one_rank` support compiles
+on one rank for execution on multiple ranks; it does not by itself establish
+simultaneous multi-coordinate execution in one process.
 
 **Extend DeviceMesh with coordinate ownership.** This could reduce the number of
 public abstractions if rank-based mesh construction and local mesh construction
@@ -488,6 +627,13 @@ Before agreeing to the architecture:
   backends, and C++ DTensor dispatch?
 * Should the first upstream contribution be the local executor interface, or an
   extraction of reusable logical propagation machinery that enables it?
+* What representation reaches the AOT-to-backend boundary for multiple locally
+  owned components, including output reconstruction and FakeTensor behavior?
+* Which local redistribution operations have a shared semantic representation,
+  when are they decomposed, and where can a backend select joint lowering?
+* How do the chosen graph and effect representations preserve placement
+  constraints, aliases, distributed collective matching and completion
+  dependencies through compiler optimization?
 
 Before stabilizing the implementation:
 
@@ -523,10 +669,11 @@ sharding. Illustrative API names and experimental scope remain proposals.
 
 ### Next Steps
 
-Discuss the mesh/execution boundary with DTensor maintainers, agree on the
-smallest experimental contribution, and then prepare an implementation proposal
-and tracking issue. Retain the CPU reference and accelerator realization as
-separate stages so logical correctness does not depend on native hardware
+Discuss the mesh/execution boundary and compiler representation with DTensor and
+compiler maintainers, agree on the capture and redistribution-lowering contract
+for the smallest experimental contribution, and then prepare an implementation
+proposal and tracking issue. Retain the CPU reference and accelerator realization
+as separate stages so logical correctness does not depend on native hardware
 availability.
 
 Plan hierarchical local/distributed composition as the required step after the
