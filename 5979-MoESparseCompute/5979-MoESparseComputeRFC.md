@@ -90,13 +90,13 @@ Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id 
 | A2 | `softmax` (dim=E) | `[Tq,E]` (A1) | `[Tq, E]` | df16 | `E` | reduces **along** the stick dim |
 | A3 | `restickify` | `[Tq,E]` (A2) | `[Tq, E]` | df16 | `Tq` | stick dim `E`→`Tq`; moves the selection/reduction axis `E` off the stick |
 | A4 | `topk_idx` (K=8, dim=E) | `[Tq,E]` (A3) | `idx [Tq,K]` | df16 | `Tq` | index output only; selects **across** sticks. Exact in df16 (`E = 128` needs 7 bits) |
-| A5 | `keep_by_index` | `[Tq,E]` (A3), `idx[Tq,K]` (A4) | `[Tq, E]` | df16 | `Tq` | keeps the top-K scores, others → 0 |
+| A5 | `keep_by_index` | `[Tq,E]` (A3), `idx[Tq,K]` (A4) | `[Tq, E]` | df16 | `Tq` | keeps the top-K scores, others → 0 (`maskval = 0`) |
 | A6 | `sum_nonstick` (dim=E) | `[Tq,E]` (A5) | `[Tq, 1]` | df16 | `Tq` | renormalize denominator |
 | A7 | `realdiv` | `[Tq,E]` (A5) ÷ `[Tq,1]` (A6) | `[Tq, E]` | df16 | `Tq` | renormalized routing weights |
 | A8 | `restickify` | `[Tq,E]` (A7) | `[Tq, E]` | df16 | `E` | stick dim `Tq`→`E`; brings `E` back into the stick |
 | A9 | `df16tofp32` | `[Tq,E]` (A8) | `[Tq, E]` | fp32 | `E` (32) | 32 `E` per stick. Output is **staggered** along `E`: each 64-wide df16 stick yields fp32 sticks holding `0..3, 8..11, …` then `4..7, 12..15, …`. fp32 is needed because token ids up to `Tq = 8192` aren't exact in df16 |
 | A10 | `unstagger_stick_ea` | `[Tq,E]` (A9) | `score [Tq, E]` | fp32 | `E` (32) | restores contiguous `E` order |
-| A11 | `non_zero_pos_to_idx` (dim=Tq) **[NEW]** | `score[Tq,E]` (A10) | `run_pos [Tq, E]` | fp32 | `E` (32) | scans **across** sticks along `Tq`, independently per `E` lane. Non-zero entry → number of non-zeros before it in this `E` column (its slot in the expert's list); zero entry → dummy location `Tq` (the `(Tq+1)`-th row) |
+| A11 | `non_zero_pos_to_idx` (dim=Tq) **[NEW]** | `score[Tq,E]` (A10) | `run_pos [Tq, E]` | fp32 | `E` (32) | scans **across** sticks along `Tq`, independently per `E` lane. Non-zero entry → number of non-zeros before it in this `E` column (its slot in the expert's list); zero entry → dummy location `Tq` (the `(Tq+1)`-th row), given as the op's `padval` parameter |
 | A12 | `count_non_zero_div_ceil` (dim=Tq, divisor=G) **[NEW]** | `score[Tq,E]` (A10) | `nc [1, E]` | fp32 | `E` (32) | counts non-zeros along `Tq` per `E` lane (`cnt[e]`), divides by `G` and rounds up: `nc[e] = max(1, ⌈cnt[e]/G⌉)`. **A count of 0 gives 1**, so `nc[e] ≥ 1` |
 | A13 | `idx2Addr` | `run_pos[Tq,E]` (A11) | `run_addr [Tq, E]` | int32 | `E` (32) | slot → address in the `[Tq+1,E,32]` scatter destination (A15). Fed to the A16 scatters as is, with no dummy dim. Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
 | A14a | `restickify` | `score[Tq,E]` (A10) | `[Tq, E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per (token, expert) entry |
@@ -176,7 +176,7 @@ Constant: `exp_ids : [E]` int32 = `0 .. E-1`, precomputed. Feeds the expert-id s
 | B10 | `df16tofp32` | `sel[1,E]` (B9) | `[1, E]` | fp32 | `E` (32) | output staggered along `E`, as in prefill A9 |
 | B11 | `unstagger_stick_ea` | `[1,E]` (B10) | `[1, E]` | fp32 | `E` (32) | restores contiguous `E` order |
 | B12 | `restickify` | `[1,E]` (B11) | `[E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per expert |
-| B13a | `non_zero_pos_to_idx` (dim=E) **[NEW]** | `[E,32]` (B12) | `run_pos [E, 32]` | fp32 | dummy (32) | same op as prefill A11, scanning along `E`. Selected expert → its slot `j` among the selected experts; unselected → dummy location `E` |
+| B13a | `non_zero_pos_to_idx` (dim=E) **[NEW]** | `[E,32]` (B12) | `run_pos [E, 32]` | fp32 | dummy (32) | same op as prefill A11, scanning along `E`. Selected expert → its slot `j` among the selected experts; unselected → dummy location `E` (`padval = E`) |
 | B13b | `count_non_zero_div_ceil` (dim=E, divisor=1) **[NEW]** | `[E,32]` (B12) | `E_sel [1, 32]` | fp32 | dummy (32) | same op as prefill A12 with divisor 1, i.e. a plain count: `E_sel` = number of selected experts. The 0 → 1 case never triggers, since every token selects `K` experts |
 | B14 | `idx2Addr` | `run_pos[E,32]` (B13a) | `run_addr [E, 32]` | int32 | dummy (32) | slot → address in the `[E+1,32]` scatter destination (B15). Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
 | B15 | `init` | — | `[E+1, 32]` | int32 | dummy (32) | scatter destination. Row `E` is the sink for unselected experts. Slots `≥ E_sel` are never read by the loop, so the fill value doesn't matter |
@@ -258,11 +258,11 @@ on each device d in parallel:
 ### New and modified ops
 
 1. Matmul (decode B19, B20, B23): indirect access into the weight tensor; a `[B × dmodel]` GEMM rather than a GEMV.
-2. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location `Tq` / `E` for zero entries. The op interface specifies a single scan dimension. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
+2. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location `Tq` / `E` for zero entries, passed as the op's `padval` parameter. The op interface specifies a single scan dimension, which cannot be split across cores. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
 3. `count_non_zero_div_ceil` (prefill A12, decode B13b): **new op**. Count non-zeros along the reduction dimension, divide by `G` and round up, with 0 → 1. Decode uses divisor 1.
-4. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). It doesn't today. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
+4. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). The index tensor of an indirect access can be FP32, as long as it holds integer values. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
 5. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A14b, decode expert loop `E_sel` from B13b):
-   - a) SDSCbundle interface: assign each loop the tensor address its loop count is read from
+   - a) SDSCbundle interface: `sdscbundle.load_value_at_address` reads the loop count from a tensor address, stored in FP32 as the first value of a stick, with `max_value` the largest count it can hold. Its result is the upper bound of the `scf.for`
    - b) Backend program looping where the loop count comes from a tensor read
 
 `df16tofp32` outputs are staggered along the stick; `unstagger_stick_ea` restores contiguous order (see [RFC 2971 — FP32 Element Arrangement](../2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md)).
