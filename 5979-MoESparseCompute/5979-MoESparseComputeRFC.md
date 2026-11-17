@@ -9,7 +9,7 @@ This RFC proposes sparse kernels for the MoE (sparse FFN) block on Spyre, using 
 * **Chunked prefill:** each expert computes only on the tokens routed to it, instead of every expert computing on every token. The chunk size is chosen so that each expert gets about 512 tokens on average (`Tq = 512·E/K` = 8192). Each expert's tokens are processed in 512-token tiles in a dynamic loop. A tile with fewer than 512 real tokens is padded with dummy tokens.
 * **Decode:** there is no per-token loop. The whole batch runs through each *selected* expert in a dynamic loop over the `E_sel` distinct experts chosen anywhere in the batch, so each selected expert's weights are fetched once.
 * **Shared experts** run on all tokens in both phases.
-* The router needs two **new ops** (`non_zero_pos_to_idx`, `count_non_zero_round_up`) and changes to two existing ones.
+* The router needs two **new ops** (`non_zero_pos_to_idx`, `count_non_zero_div_ceil`) and changes to two existing ones.
 
 Across devices, the block uses tensor parallelism: each device holds a `1/D` slice of every expert's intermediate dim, and an AllReduce at the end combines the partial outputs.
 
@@ -70,7 +70,7 @@ Each expert computes only on the tokens routed to it. Its routed tokens are proc
 3. Gather the same rows of a partial-output buffer `moe_out[Tq+1,dmodel]`.
 4. Add, and scatter back.
 
-A tile with fewer than 512 real tokens is padded with **dummy tokens**. These read a zero pad row appended to the input and write to a sink row in `moe_out`, so their results are discarded. An expert with `cnt[e] = 0` still runs one all-dummy tile, because A12 rounds 0 up to `G`. Every loop count is therefore ≥ 1, at the cost of at most one extra weight fetch per unused expert. After the routed experts, the shared expert(s) run on all `Tq` tokens and add into the same buffer.
+A tile with fewer than 512 real tokens is padded with **dummy tokens**. These read a zero pad row appended to the input and write to a sink row in `moe_out`, so their results are discarded. An expert with `cnt[e] = 0` still runs one all-dummy tile, because A12 gives 1 tile for a count of 0. Every loop count is therefore ≥ 1, at the cost of at most one extra weight fetch per unused expert. After the routed experts, the shared expert(s) run on all `Tq` tokens and add into the same buffer.
 
 The router turns the dense `[Tq,E]` routing weights into per-expert packed token lists:
 
@@ -97,10 +97,10 @@ Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id 
 | A9 | `df16tofp32` | `[Tq,E]` (A8) | `[Tq, E]` | fp32 | `E` (32) | 32 `E` per stick. Output is **staggered** along `E`: each 64-wide df16 stick yields fp32 sticks holding `0..3, 8..11, …` then `4..7, 12..15, …`. fp32 is needed because token ids up to `Tq = 8192` aren't exact in df16 |
 | A10 | `unstagger_stick_ea` | `[Tq,E]` (A9) | `score [Tq, E]` | fp32 | `E` (32) | restores contiguous `E` order |
 | A11 | `non_zero_pos_to_idx` (dim=Tq) **[NEW]** | `score[Tq,E]` (A10) | `run_pos [Tq, E]` | fp32 | `E` (32) | scans **across** sticks along `Tq`, independently per `E` lane. Non-zero entry → number of non-zeros before it in this `E` column (its slot in the expert's list); zero entry → dummy location `Tq` (the `(Tq+1)`-th row) |
-| A12 | `count_non_zero_round_up` (dim=Tq, G) **[NEW]** | `score[Tq,E]` (A10) | `cnt_r [1, E]` | fp32 | `E` (32) | counts non-zeros along `Tq` per `E` lane (`cnt[e]`) and rounds up: `cnt_r[e] = max(G, ⌈cnt[e]/G⌉·G)`. **0 rounds to `G`**, so `nc[e] = cnt_r[e]/G ≥ 1` |
+| A12 | `count_non_zero_div_ceil` (dim=Tq, divisor=G) **[NEW]** | `score[Tq,E]` (A10) | `nc [1, E]` | fp32 | `E` (32) | counts non-zeros along `Tq` per `E` lane (`cnt[e]`), divides by `G` and rounds up: `nc[e] = max(1, ⌈cnt[e]/G⌉)`. **A count of 0 gives 1**, so `nc[e] ≥ 1` |
 | A13 | `idx2Addr` | `run_pos[Tq,E]` (A11) | `run_addr [Tq, E]` | int32 | `E` (32) | slot → address in the `[Tq+1,E,32]` scatter destination (A15). Fed to the A16 scatters as is, with no dummy dim. Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
 | A14a | `restickify` | `score[Tq,E]` (A10) | `[Tq, E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per (token, expert) entry |
-| A14b | `restickify` | `cnt_r[1,E]` (A12) | `[1, E, 32]` | fp32 | dummy (32) | one stick per expert; source of the `nc[e]` loop bound |
+| A14b | `restickify` | `nc[1,E]` (A12) | `[1, E, 32]` | fp32 | dummy (32) | one stick per expert; source of the `nc[e]` loop bound |
 | A15 | `init` (fill = `Tq`) | — | `[Tq+1, E, 32]` | fp32 / int32 | dummy (32) | every entry points at the dummy pad token (row `Tq` of `x_pad`, A19). Initial destination for A16a (fp32 copy) and A16b (int32 copy) |
 | A16a | `scatter` (score) | `[Tq,E,32]` (A14a), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | fp32 | dummy (32) | entry `(t,e)` → row `run_pos[t,e]`, expert `e`. Zero entries all land in dummy row `Tq` |
 | A16b | `scatter` (token id) | `tok_ids[Tq]` (constant), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | int32 | dummy (32) | entry `(t,e)` writes token id `t` to row `run_pos[t,e]`, expert `e`; the same `tok_ids` is used for every `e`. **Slowest op:** each scatter is `Tq·E·128 B` = 128 MB at `E = 128`, ~256 MB for A16a+A16b ⇒ can take **~10+ ms**. WIP to optimize |
@@ -113,7 +113,7 @@ Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id 
 
 **Routed experts**
 
-`nc[e] = cnt_r[e]/G ≥ 1` (A12 → A14b). Tile slots run up to `nc[e]·G − 1 ≤ Tq − 1`, since `cnt_r[e] ≤ Tq` (`cnt[e] ≤ Tq`, `Tq` is a multiple of `G`, and `G ≤ Tq`), so tiles never read past `Tq+1` rows. Slots from `cnt[e]` up to the end of the last tile hold the pad id `Tq`. Those dummy tokens read `x_pad[Tq]` and write `moe_out[Tq]` (the sink).
+`nc[e] = max(1, ⌈cnt[e]/G⌉) ≥ 1` (A12 → A14b). Tile slots run up to `nc[e]·G − 1 ≤ Tq − 1`, since `nc[e]·G ≤ Tq` (`cnt[e] ≤ Tq`, `Tq` is a multiple of `G`, and `G ≤ Tq`), so tiles never read past `Tq+1` rows. Slots from `cnt[e]` up to the end of the last tile hold the pad id `Tq`. Those dummy tokens read `x_pad[Tq]` and write `moe_out[Tq]` (the sink).
 
 | # | Op | Inputs | Output shape | Precision | Stick dim | Notes |
 |---|---|---|---|---|---|---|
@@ -177,7 +177,7 @@ Constant: `exp_ids : [E]` int32 = `0 .. E-1`, precomputed. Feeds the expert-id s
 | B11 | `unstagger_stick_ea` | `[1,E]` (B10) | `[1, E]` | fp32 | `E` (32) | restores contiguous `E` order |
 | B12 | `restickify` | `[1,E]` (B11) | `[E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per expert |
 | B13a | `non_zero_pos_to_idx` (dim=E) **[NEW]** | `[E,32]` (B12) | `run_pos [E, 32]` | fp32 | dummy (32) | same op as prefill A11, scanning along `E`. Selected expert → its slot `j` among the selected experts; unselected → dummy location `E` |
-| B13b | `count_non_zero_round_up` (dim=E, G=1) **[NEW]** | `[E,32]` (B12) | `E_sel [1, 32]` | fp32 | dummy (32) | same op as prefill A12 with `G = 1`, i.e. a plain count: `E_sel` = number of selected experts. The 0 → 1 rounding never triggers, since every token selects `K` experts |
+| B13b | `count_non_zero_div_ceil` (dim=E, divisor=1) **[NEW]** | `[E,32]` (B12) | `E_sel [1, 32]` | fp32 | dummy (32) | same op as prefill A12 with divisor 1, i.e. a plain count: `E_sel` = number of selected experts. The 0 → 1 case never triggers, since every token selects `K` experts |
 | B14 | `idx2Addr` | `run_pos[E,32]` (B13a) | `run_addr [E, 32]` | int32 | dummy (32) | slot → address in the `[E+1,32]` scatter destination (B15). Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
 | B15 | `init` | — | `[E+1, 32]` | int32 | dummy (32) | scatter destination. Row `E` is the sink for unselected experts. Slots `≥ E_sel` are never read by the loop, so the fill value doesn't matter |
 | B16 | `scatter` (expert id) | `exp_ids[E]` (constant), `run_addr` (B14), dest (B15) | `sel_list [E+1, 32]` | int32 | dummy (32) | packs selected expert ids into slots `0..E_sel-1`. Only `E·128 B` = 16 KB at `E = 128` ⇒ cheap |
@@ -259,7 +259,7 @@ on each device d in parallel:
 
 1. Matmul (decode B19, B20, B23): indirect access into the weight tensor; a `[B × dmodel]` GEMM rather than a GEMV.
 2. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location `Tq` / `E` for zero entries. The op interface specifies a single scan dimension. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
-3. `count_non_zero_round_up` (prefill A12, decode B13b): **new op**. Count non-zeros along the scan dimension and round up to a multiple of `G`, with 0 → `G`. Decode uses `G = 1`.
+3. `count_non_zero_div_ceil` (prefill A12, decode B13b): **new op**. Count non-zeros along the reduction dimension, divide by `G` and round up, with 0 → 1. Decode uses divisor 1.
 4. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). It doesn't today. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
 5. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A14b, decode expert loop `E_sel` from B13b):
    - a) SDSCbundle interface: assign each loop the tensor address its loop count is read from
