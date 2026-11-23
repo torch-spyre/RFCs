@@ -6,10 +6,9 @@
 * Ashok Pon Kumar
 
 > Code references link to torch-spyre `main` at [`0adfa223`][main-commit], or,
-> for code that [#5081][pr-5081] adds, to its head at [`86ae782a`][pr-commit],
-> which is [#5081][pr-5081] rebased onto that `main`. Hardware results come from that head
-> unless a case is marked †, in which case they were measured on [#5081][pr-5081] on
-> `main` @ `4283b158`.
+> for code that [#5081][pr-5081] adds, to its head at [`29cbdd20`][pr-commit],
+> which is [#5081][pr-5081] rebased onto that `main`. [Cases evaluated](#cases-evaluated)
+> says which commit each hardware result comes from.
 
 ## **Summary**
 
@@ -23,7 +22,8 @@ This RFC proposes a **launch spec**: a JSON file,
 `spyreCodeDir/launch_spec.json`, that the compiler writes on every compile and
 `spyre-cli` reads. It records:
 
-- for each positional argument: role, host shape, host dtype and device layout;
+- for each positional argument: role, host shape, host strides and offset, host
+  dtype and device layout;
 - the size of the pool tensor the caller must pass, if any;
 - the bundle's runtime-slot descriptors.
 
@@ -93,7 +93,7 @@ produce the same loadable folder, so the contract has to be emitter-neutral.
 ## **What the folder holds today**
 
 Extracted from a compile of `torch.compile(a + b)` at `[10, 512]` fp16 with
-[#5081][pr-5081] at [`86ae782a`][pr-commit], with the kernel cache off. The folder holds
+[#5081][pr-5081] at [`86ae782a`][pr-prev], with the kernel cache off. The folder holds
 `spyreCodeDir/` and, next to it, the compile-stage `bundle.mlir` and
 `sdsc_0.json`, which nothing reads at launch. [`prepare_kernel`][m-prepare-kernel]
 loads `spyreCodeDir/spyrecode.json` and `spyreCodeDir/init_binary.bin`; with
@@ -167,6 +167,11 @@ What each part is:
 | `DataTransfer` | copies the correction from the host to the device |
 | `ComputeOnDevice` | runs the program at `job_bin_ptr`, the address `InitTransfer` loaded it to |
 
+The slot numbers and the count of derived values are not fixed for an op. This
+compile split the add across 20 cores; a compile of the same add at
+[`29cbdd20`][pr-commit] split it across 2, and has 6 derived values and slots
+`[-7, -8, -9]`.
+
 There is no host shape, host dtype or input/output role for any argument, and
 nothing says which slot is an address and which is a size. The declared dynamic
 gelu's `spyrecode.json` also has three slots (two addresses and the loop count),
@@ -192,7 +197,7 @@ kernel's arguments.
 | host shape, host dtype, input or output | no | no | yes |
 | device layout each argument must have | no | compiled in | yes |
 | whether to prepend a pool tensor, and its size | no | no | yes |
-| host strides and storage offset | no | no | proposed |
+| host strides and storage offset | no | no | yes |
 | which graph input each argument came from | no | no | open |
 | device memory to reserve, and the program to run | yes | yes | not needed |
 
@@ -204,7 +209,7 @@ fills.
 
 ### The launch spec
 
-The spec [#5081][pr-5081] at [`86ae782a`][pr-commit] wrote for the same `[10, 512]` add,
+The spec [#5081][pr-5081] at [`29cbdd20`][pr-commit] wrote for the same `[10, 512]` add,
 whitespace compacted:
 
 ```json
@@ -217,15 +222,18 @@ whitespace compacted:
     {"arg_index": 0, "role": "input", "shape": [10, 512], "dtype": "float16",
      "layout": {"device_size": [8, 10, 64], "stride_map": [64, 512, 1],
                 "device_dtype": "SEN169_FP16", "element_arrangement": "STANDARD",
-                "valid_elements": [[[0, 2], 512], [[1], 10]]}},
+                "valid_elements": [[[0, 2], 512], [[1], 10]]},
+     "stride": [512, 1], "storage_offset": 0},
     {"arg_index": 1, "role": "input", "shape": [10, 512], "dtype": "float16",
      "layout": {"device_size": [8, 10, 64], "stride_map": [64, 512, 1],
                 "device_dtype": "SEN169_FP16", "element_arrangement": "STANDARD",
-                "valid_elements": [[[0, 2], 512], [[1], 10]]}},
+                "valid_elements": [[[0, 2], 512], [[1], 10]]},
+     "stride": [512, 1], "storage_offset": 0},
     {"arg_index": 2, "role": "output", "shape": [10, 512], "dtype": "float16",
      "layout": {"device_size": [8, 10, 64], "stride_map": [64, 512, 1],
                 "device_dtype": "SEN169_FP16", "element_arrangement": "STANDARD",
-                "valid_elements": [[[0, 2], 512], [[1], 10]]}}
+                "valid_elements": [[[0, 2], 512], [[1], 10]]},
+     "stride": [512, 1], "storage_offset": 0}
   ],
   "emitter": "sdsc",
   "symbol_kinds": [
@@ -257,11 +265,13 @@ the same commit:
     {"arg_index": 0, "role": "input", "shape": ["s77", 64], "dtype": "float16",
      "layout": {"device_size": [1, 512, 64], "stride_map": [64, 64, 1],
                 "device_dtype": "SEN169_FP16", "element_arrangement": "STANDARD",
-                "valid_elements": [[[0, 2], 64], [[1], 512]]}},
+                "valid_elements": [[[0, 2], 64], [[1], 512]]},
+     "stride": [64, 1], "storage_offset": 0},
     {"arg_index": 1, "role": "output", "shape": ["s77", 64], "dtype": "float16",
      "layout": {"device_size": [1, 512, 64], "stride_map": [64, 64, 1],
                 "device_dtype": "SEN169_FP16", "element_arrangement": "STANDARD",
-                "valid_elements": [[[0, 2], 64], [[1], 512]]}}
+                "valid_elements": [[[0, 2], 64], [[1], 512]]},
+     "stride": [64, 1], "storage_offset": 0}
   ],
   "emitter": "sdsc",
   "symbol_kinds": [
@@ -288,12 +298,12 @@ finds one missing refuses. **Optional** fields are for diagnostics only.
 |---|---|---|---|
 | `version` | required | schema evolution; a reader refuses a newer major ([`load_launch_spec`][p-load-launch-spec]) | implemented |
 | `kernel_name` | required | which kernel this spec describes | implemented |
-| `args[].arg_index` | required | binding is positional. It is the kernel's call order, not the traced function's argument order (C3) | implemented |
-| `args[].role` | required | `input`, `output` or `input_output`; the bundle signature has no output category | `input`/`output` implemented; `input_output` proposed (C1) |
+| `args[].arg_index` | required | binding is positional, so a spec whose indices are not exactly `0..n-1` is refused ([`LaunchSpec.from_dict`][p-from-dict], C5). It is the kernel's call order, not the traced function's argument order (C3) | implemented |
+| `args[].role` | required | `input`, `output` or `input_output`; the bundle signature has no output category. An argument the kernel both reads and writes is `input_output` ([`_record_launch_spec_arg`][p-role-merge], C1) | implemented |
 | `args[].shape` | required | host shape. Ints, or a symbol's name where the binary takes that size at launch | implemented |
 | `args[].dtype` | required | host dtype, as a full torch name | implemented |
 | `args[].layout` | required | the `SpyreTensorLayout` the kernel was compiled against: `device_size`, `stride_map`, `device_dtype`, `element_arrangement` (enums by name) and `valid_elements` ([`LaunchArgLayout`][p-launch-arg-layout]) | implemented |
-| `args[].stride`, `args[].storage_offset` | required | host strides; a non-contiguous argument cannot be rebuilt from shape alone (B1, B2) | proposed |
+| `args[].stride`, `args[].storage_offset` | required | host strides and offset, recorded like `shape`; a non-contiguous argument cannot be rebuilt from shape alone (B1, B2) | implemented |
 | `pool_size` | required | bytes of the pool tensor the *caller* must pass; `0` when the bundle allocates its own | implemented |
 | `bundle_symbolic_args` | required | spec-driven launch covers `true` only | recorded; refusing `false` not implemented |
 | `symbol_kinds` | required when non-empty | the runtime-slot descriptors, one `dataclasses.asdict(`[`SymbolKind`][m-symbolkind]`)` per slot | implemented |
@@ -318,32 +328,36 @@ Field notes:
   constructor that takes it ([`spyre_layout`][p-spyre-layout],
   [`module.cpp`][m-py-ctors]), and a spec without the field reads as `{}`,
   which that constructor documents as "unknown".
-* **Layout comparison ignores size-1 device dimensions**
-  ([`_layout_mismatch`][p-layout-mismatch]). Such a dimension is always indexed
-  at 0, so two layouts that differ only in them place every element in the same
-  place (B6).
+* **A layout the consumer cannot rebuild is refused**, never replaced by the
+  default (B5): an enum name this build does not know, a missing layout, or
+  values the constructor rejects ([`spyre_layout`][p-spyre-layout]).
+* **Layout comparison** is the placement without size-1 device dimensions, plus
+  the element arrangement ([`_layout_mismatch`][p-layout-mismatch]). A size-1
+  dimension is always indexed at 0, so two layouts that differ only in them place
+  every element in the same place (B6). Two layouts with the same placement can
+  still hold different bytes, so the arrangement is compared too (B4).
+* **Host strides** are allocated as recorded ([`_alloc`][p-alloc]) and compared
+  without size-1 dimensions, whose strides torch leaves arbitrary
+  ([`_stride_mismatch`][p-stride-mismatch]). `tensors_from_spec` refuses a
+  nonzero `storage_offset`, since it allocates fresh storage and cannot place a
+  tensor inside a larger one. A tensor with non-contiguous strides is filled by
+  copying from a host tensor with the same strides (B7,
+  [README][p-readme-strided]).
 * **Device dtype is the contract.** `float16`, `bfloat16` and `bool` all map to
   `SEN169_FP16` ([`types_mapping.h`][m-types-map]), and one compiled folder
   serves all three (A4). A host-dtype difference gives a warning; a device-dtype
   difference is refused ([`check_tensors_against_spec`][p-check]).
 * **Compatibility.** Unknown keys are ignored on read
-  ([`LaunchSpec.from_dict`][p-launch-spec]), so a newer minor version still
+  ([`LaunchSpec.from_dict`][p-from-dict]), so a newer minor version still
   loads.
 * **No per-argument name.** Binding is by position; C3 shows what that leaves
   open.
 * **Scalar operands**, such as the `2` in `x * 2`, become 0-d tensor arguments
   (`shape: []`) with their own slot.
 
-The two fields still proposed would take these values for the same kernels:
-
-```text
-ADD, arg 0:   "stride": [512, 1], "storage_offset": 0
-K1, arg 0:    "stride": [64, 1],  "storage_offset": 0
-K1:           "symbols": {"s77": {"max_value": 512, "granularity": 64}}
-```
-
-The `symbols` range is copied from the `loop_dimension` slot, so it cannot
-disagree with it.
+The `symbols` range is still proposed. For the gelu above it would be
+`{"s77": {"max_value": 512, "granularity": 64}}`, copied from the
+`loop_dimension` slot so that it cannot disagree with it.
 
 ### Dynamic dimensions
 
@@ -390,8 +404,12 @@ torch.compile -> Inductor -> SuperDSCScheduling
   SpyreKernel.codegen_kernel()
     for each kernel argument, as arg_index is assigned:
       _record_launch_spec_arg(name, tensor_arg)
-        reads the buffer's FixedTiledLayout: host shape, dtype, device layout
-        -> LaunchArg(arg_index, role, shape, dtype, LaunchArgLayout)
+        reads the buffer's FixedTiledLayout: host shape, strides, offset, dtype,
+        device layout; an argument seen as both input and output -> input_output
+        -> LaunchArg(arg_index, role, shape, dtype, LaunchArgLayout, stride, offset)
+        an argument it cannot record is remembered
+  SpyreKernel.launch_args()
+    every argument, indices 0..n-1 -> [LaunchArg(...)]; otherwise []
   SuperDSCScheduling.define_kernel()
     async_compile.sdsc(name, <op specs>, pool_size=..., precomputed_key=...,
                        launch_args=[LaunchArg(...)])
@@ -427,6 +445,11 @@ Why each piece sits where it does:
   wrapper ([`SPYRE_WRAPPER_IMPORTS`][m-wrapper-imports]).
 * **Written next to `generate_bundle`**, where `symbol_kinds` exist, so the spec
   copies that list rather than deriving its own.
+* **All or nothing.** If any argument could not be recorded, or the indices are
+  not `0..n-1`, `launch_args` is empty and no spec is written
+  ([`launch_args`][p-launch-args]). Binding is positional, so a hole would give
+  every later tensor the wrong slot (C5). The reader refuses such a spec as well
+  ([`LaunchSpec.from_dict`][p-from-dict]).
 * **Writing never fails a compile.** A recording or writing error is logged and
   the spec is skipped ([`_write_launch_spec`][p-write]); the folder still
   launches the old way.
@@ -438,11 +461,15 @@ Why each piece sits where it does:
 ```text
 spyre_cli.launch_spec   (needs torch_spyre._C, because it works with live tensors)
   load_kernelspec(folder)                  -> LaunchSpec | None
-  tensors_from_spec(spec, bindings)        -> uninitialised tensors in the recorded layouts,
-                                              pool prepended when the caller supplies one
-  default_tensors(spec, tensors)           -> ones into role == input (the smoke test)
+  tensors_from_spec(spec, bindings)        -> uninitialised tensors in the recorded layouts
+                                              and host strides, pool prepended when the
+                                              caller supplies one; raises on a layout it
+                                              cannot rebuild or a nonzero offset
+  default_tensors(spec, tensors)           -> ones into input and input_output, copied from
+                                              a host tensor with the same strides (smoke test)
   check_tensors_against_spec(spec, tensors, bindings) -> list of problems:
-                                              count, pool bytes, shape, device dtype, layout
+                                              count, pool bytes, shape, host strides and
+                                              offset, device dtype, layout and arrangement
 spyre_cli.core
   launch(*tensors, path)                   -> runner built with the spec's symbol_kinds
   launch_from_cli(path, -i/-o, bindings)   -> spec only: tensors_from_spec + default_tensors
@@ -466,7 +493,7 @@ import spyre_cli
 
 spec = spyre_cli.load_kernelspec(folder)                    # what the artifact requires
 tensors = spyre_cli.tensors_from_spec(spec, {"s77": 256})   # allocated, uninitialised
-tensors[0].copy_(my_input)                                  # the caller's own data
+tensors[0].copy_(my_input)                                  # the caller's own data (B7 if non-contiguous)
 assert not spyre_cli.check_tensors_against_spec(spec, tensors, {"s77": 256})
 runner = spyre_cli.launch(*tensors, path=folder)            # keep the runner alive until read back
 torch.testing.assert_close(tensors[1].cpu(), expected)
@@ -494,7 +521,7 @@ side.
 | 1 | schema and serializer; spec emitted on every compile, SDSC and KTIR | done ([#5081][pr-5081]) |
 | 2 | `spyre-cli` reads the spec: tensors built from it, shape/dtype/layout checks, `symbol_kinds` passed to the runner, every output printed by role, Python API | done ([#5081][pr-5081]) |
 | 3 | dynamic dims: `--bind` and expression folding (done); slot ranges and binding checks; traced size for size-specific kernels | in progress |
-| 4 | layout fidelity: `valid_elements` and size-1-dim-tolerant comparison (done); host strides and offset, full layout equality, failing closed, `input_output`, all-or-nothing specs | in progress |
+| 4 | layout fidelity: `valid_elements`, host strides and offset, layout comparison without size-1 dims and with the arrangement, failing closed, `input_output`, all-or-nothing specs | done ([#5081][pr-5081]) |
 | 5 | `--list`/`--kernel` for multi-kernel folders, `kernel_provenance` for profiler joins | not started |
 
 Input files and numerical verification are not part of the launch spec: the
@@ -508,7 +535,10 @@ held only the folder, through `spyre-cli`'s own functions, compared against CPU
 or the compiled result. Outputs were prefilled with a sentinel, so "never
 written" is told apart from "written wrong". The kernel cache was off, so the
 spec was the only slot descriptor on disk. † marks a case measured on [#5081][pr-5081] on
-`main` @ `4283b158`; every other case was measured at [`86ae782a`][pr-commit].
+`main` @ `4283b158`; every other case was measured at [`86ae782a`][pr-prev]. B1, B2,
+B4, B5, C1 and C5 changed the spec: their "before" is measured as marked, and
+their "after" at [`29cbdd20`][pr-commit], where B7 was measured too. A7 and D4 were
+measured again at [`29cbdd20`][pr-commit], with the same result.
 
 **A. The basic contract**
 
@@ -526,22 +556,23 @@ spec was the only slot descriptor on disk. † marks a case measured on [#5081][
 
 | # | case | result | decision |
 |---|---|---|---|
-| B1 † | non-contiguous output (`x.t() * 2`, stride `(1, 128)`) | the spec-built tensor gets `(256, 1)` ([`_alloc`][p-alloc]); the check passes; 32534/32768 wrong. Recorded layout + host stride: correct | record `stride`, `storage_offset` (proposed) |
-| B2 † | non-contiguous input (`base.t()`, stride `(1, 256)`) | the spec-built tensor gets `(128, 1)`; the check passes; 16300/32768 wrong. Recorded layout + host strides: correct | same (proposed) |
+| B1 † | non-contiguous output (`x.t() * 2`, stride `(1, 128)`) | before: the spec-built tensor got `(256, 1)`; the check passed; 32534/32768 wrong. After: the spec records `(1, 128)`, the spec-built tensor gets it, and the launch is correct | record `stride`, `storage_offset` (added) |
+| B2 † | non-contiguous input (`base.t()`, stride `(1, 256)`) | before: the spec-built tensor got `(128, 1)`; the check passed; 16300/32768 wrong. After: the spec records `(1, 256)`, and with the input written as in B7 the launch is correct | same (added) |
 | B3 | `valid_elements` at `10x100` | [#6459][pr-6459] removed the constructor that took no `valid_elements`; the old call now raises `TypeError`, which the consumer turned into a default-layout fallback for every argument. Recorded and passed: the spec-built tensor's `valid_elements` is `{(0, 2): 100, (1,): 10}`, the same as `.to("spyre")`, and the launch is correct | added |
-| B4 | FP8 `_scaled_mm` with `QFP8CH`/`QFP8WT` inputs, given `STANDARD` tensors with the same `device_size`/`stride_map` | the check passes, because [`_layout_mismatch`][p-layout-mismatch] does not compare the arrangement; `SpyreTensorLayout ==` ([C++][m-stl-eq], [Python][m-py-eq]) says unequal; 3836/4096 wrong. With the spec layouts: correct | compare the arrangement (proposed) |
-| B5 | the spec names an arrangement this build does not know | [`spyre_layout`][p-spyre-layout] falls back to the default layout; the check passes; 48305/57600 wrong on the depthwise conv | fail closed (proposed) |
+| B4 | FP8 `_scaled_mm` with `QFP8CH`/`QFP8WT` inputs, given `STANDARD` tensors with the same `device_size`/`stride_map` | before: the check passed, because the layout comparison left out the arrangement, though `SpyreTensorLayout ==` ([C++][m-stl-eq], [Python][m-py-eq]) says unequal; 3836/4096 wrong. After: refused (*expected element arrangement QFP8CH, got STANDARD*). With the spec layouts: correct | compare the arrangement (added) |
+| B5 | the spec names an arrangement this build does not know | before: the consumer fell back to the default layout; the check passed; 48305/57600 wrong on the depthwise conv. After: refused (*its element arrangement '...' is not one this build knows*); the conv's own spec still launches correctly | fail closed (added) |
 | B6 | `mean(dim=-1, keepdim=True)` output, `(512, 1)` | recorded as `device_size [1, 1, 512, 64]`; `torch.empty((512, 1))` gets `[1, 512, 64]`; the two place every element alike, and the launch is correct, but a raw comparison refused it | compare without size-1 device dims (added) |
+| B7 | writing B2's spec-built input (stride `(1, 256)`) with `copy_` from a contiguous host tensor | 32512/32768 elements never written. From a host tensor with the same strides: all correct | the ones fill copies from a host tensor with the destination's strides, and the [README][p-readme-strided] shows the same for a caller's data; the copy itself is outside the launch spec |
 
 **C. Completeness of the spec**
 
 | # | case | result | decision |
 |---|---|---|---|
-| C1 † | in-place `x.add_(y)` | `x` is recorded as `output`; one record per `arg_index`, the last wins ([`spyre_kernel.py`][p-last-wins]); the ones-fill skips it: 778 (sentinel + 1) instead of 2 | emit `input_output` (proposed) |
+| C1 † | in-place `x.add_(y)` | before: `x` was recorded as `output`, since one record per `arg_index` was kept and the last won ([`spyre_kernel.py`][p-last-wins]); the ones-fill skipped it: 778 (sentinel + 1) instead of 2. After: `x` is `input_output` and the ones-fill gives 2 | emit `input_output` (added) |
 | C2 † | an output another op in the same kernel reads (`a = x + y; return a, a * y`) | `a` recorded as `output`, correctly | no change |
 | C3 † | argument order | for C2 the generated wrapper calls `.run(arg1_1, arg0_1, ...)`: kernel arg 0 is the function's second input | open |
 | C4 † | scalar operand (`x * 2`) | a 0-d tensor argument; the ones-fill makes it 1 | documented |
-| C5 † | an argument the producer cannot record ([skips][p-record-skip]); suspected trigger a graph constant | with freezing the compile fails first ([`pass_utils.py`][m-fixedtiled-raise]); none of the 11 kernels compiled had a hole; a hand-made hole fails loudly at launch | all or nothing (proposed) |
+| C5 † | an argument the producer cannot record ([`_record_launch_spec_arg`][p-record-skip]); suspected trigger a graph constant | with freezing the compile fails first ([`pass_utils.py`][m-fixedtiled-raise]); none of the 11 kernels compiled had a hole. Before: a hand-made hole failed loudly at launch. After: it is refused at load (*does not describe every argument: arg_index values are [0, 2], expected 0..1*), and a recording failure writes no spec ([test][p-unrecorded-test]) | all or nothing (added) |
 
 **D. Dynamic sizes**
 
@@ -561,7 +592,8 @@ spec was the only slot descriptor on disk. † marks a case measured on [#5081][
 ## **Metrics**
 
 * A wrong shape, dtype or layout fails with a diagnostic instead of launching:
-  A2, A3 and A6 are refused today; B1, B2, B4 and B5 are the target of stage 4.
+  A2, A3, A6, B4 and B5 are refused, and B1 and B2 are built correctly from the
+  spec.
 * A user retypes no shapes: `spyre launch <folder>` needs no arguments.
 * Declared dynamic folders launch from the folder alone at any size in the
   contract (D4).
@@ -582,6 +614,9 @@ spec was the only slot descriptor on disk. † marks a case measured on [#5081][
   the spec existed keeps launching without one.
 * **A spec makes a launch well-formed, not correct.** Ones inputs show that a
   folder runs, not that it computes; real data goes through the Python API.
+* **Failing closed refuses some specs from a newer build.** A spec that names an
+  arrangement or device dtype this build does not know is refused (B5) until
+  the consumer learns the name, even where the bytes would have matched.
 
 ## **Alternatives**
 
@@ -661,6 +696,9 @@ Open:
   slices along the tiled axis. Not compiled on the card yet.
 * **Two loop symbols in one kernel.** This needs additional backend compiler
   support, which will be discussed internally.
+* **Arguments at a nonzero storage offset.** Recorded, and refused by
+  `tensors_from_spec`, which allocates fresh storage. Whether it should instead
+  allocate a larger storage and place the tensor in it is open.
 * **The pool tensor's allocation.** `tensors_from_spec` allocates a plain
   `uint8` tensor; `call_kernel` gives it an explicit `SENINT8` layout
   ([`spyre_kernel.py`][m-call-kernel-pool]). Not compared on the card.
@@ -697,8 +735,13 @@ Changes from the first revision:
 
 * The spec moved from beside `spyreCodeDir/` to inside it.
 * `layout` is the `SpyreTensorLayout` fields, `valid_elements` included, instead
-  of `stick_size`/`padding`, and is always recorded; `stride` and
-  `storage_offset` are proposed.
+  of `stick_size`/`padding`, and is always recorded, along with the host
+  `stride` and `storage_offset`.
+* A layout the consumer cannot rebuild is refused, and the comparison includes
+  the element arrangement.
+* An argument both read and written is `input_output`.
+* A spec describes every argument or is not written, and a reader refuses one
+  with a gap.
 * `symbol_kinds` is load-bearing for declared dynamic kernels, not only for pool
   binding.
 * `symbols` names only what a `loop_dimension` slot binds, with the slot's range.
@@ -724,7 +767,8 @@ Changes from the first revision:
 
 <!-- commits -->
 [main-commit]: https://github.com/torch-spyre/torch-spyre/commit/0adfa223ba0fac367d021204a6d56b2ca797ffca
-[pr-commit]: https://github.com/dushyantbehl/torch-spyre/commit/86ae782a2c7b2fa3fb868c31337f68ad408a15b9
+[pr-commit]: https://github.com/dushyantbehl/torch-spyre/commit/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401
+[pr-prev]: https://github.com/dushyantbehl/torch-spyre/commit/86ae782a2c7b2fa3fb868c31337f68ad408a15b9
 
 <!-- torch-spyre main @ 0adfa223 -->
 [m-argrecord]: https://github.com/torch-spyre/torch-spyre/blob/0adfa223ba0fac367d021204a6d56b2ca797ffca/tests/op_specs/capture.py#L149-L165
@@ -764,36 +808,41 @@ Changes from the first revision:
 [m-wrapper-alloc]: https://github.com/torch-spyre/torch-spyre/blob/0adfa223ba0fac367d021204a6d56b2ca797ffca/torch_spyre/_inductor/wrapper.py#L105-L111
 [m-wrapper-imports]: https://github.com/torch-spyre/torch-spyre/blob/0adfa223ba0fac367d021204a6d56b2ca797ffca/torch_spyre/_inductor/wrapper.py#L38-L45
 
-<!-- #5081 head @ 86ae782a -->
-[p-alloc]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L175-L186
-[p-cache-hit]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/execution/async_compile.py#L730-L741
-[p-check]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L282-L382
-[p-cli]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/cli.py#L24-L56
-[p-default-tensors]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L151-L172
-[p-define-kernel]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/scheduler.py#L686-L702
-[p-fold]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/spyre_kernel.py#L1333-L1351
-[p-from-device-layout]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/codegen/kernel_launchspec.py#L55-L73
+<!-- #5081 head @ 29cbdd20 (p-last-wins: the earlier head 86ae782a, for C1's before) -->
+[p-alloc]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L204-L217
+[p-cache-hit]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/execution/async_compile.py#L730-L741
+[p-check]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L349-L466
+[p-cli]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/cli.py#L24-L56
+[p-default-tensors]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L172-L201
+[p-define-kernel]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/scheduler.py#L686-L702
+[p-fold]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/spyre_kernel.py#L1336-L1354
+[p-from-device-layout]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L55-L73
+[p-from-dict]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L183-L214
 [p-last-wins]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/spyre_kernel.py#L1394
-[p-launch]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/core.py#L175-L194
-[p-launch-arg-layout]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/codegen/kernel_launchspec.py#L39-L73
-[p-launch-args]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/spyre_kernel.py#L1396-L1401
-[p-launch-from-cli]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/core.py#L86-L172
-[p-launch-spec]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/codegen/kernel_launchspec.py#L112-L215
-[p-layout-mismatch]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L237-L279
-[p-load-kernelspec]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L76-L89
-[p-load-launch-spec]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/codegen/kernel_launchspec.py#L289-L316
-[p-pool-resolve]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/execution/async_compile.py#L287
-[p-pool-tests]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/tests/inductor/test_kernel_launchspec.py#L165-L171
-[p-readme]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/README.md
-[p-record]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/spyre_kernel.py#L1353-L1394
-[p-record-call]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/spyre_kernel.py#L1782
-[p-record-skip]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/spyre_kernel.py#L1366-L1393
-[p-runner-call]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/core.py#L18-L37
-[p-spec-path]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/codegen/kernel_launchspec.py#L264-L265
-[p-spyre-layout]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L189-L216
-[p-symbol-kinds-from-spec]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L92-L110
-[p-tensors-from-spec]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/extensions/spyre-cli/spyre_cli/launch_spec.py#L113-L148
-[p-unresolved]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/_inductor/codegen/kernel_launchspec.py#L231-L253
-[p-write]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/execution/async_compile.py#L261-L300
-[p-write-ktir]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/execution/async_compile.py#L898
-[p-write-sdsc]: https://github.com/dushyantbehl/torch-spyre/blob/86ae782a2c7b2fa3fb868c31337f68ad408a15b9/torch_spyre/execution/async_compile.py#L255-L256
+[p-launch]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/core.py#L175-L194
+[p-launch-arg-layout]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L39-L73
+[p-launch-args]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/spyre_kernel.py#L1413-L1435
+[p-launch-from-cli]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/core.py#L86-L172
+[p-launch-spec]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L130-L245
+[p-layout-mismatch]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L279-L323
+[p-load-kernelspec]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L76-L89
+[p-load-launch-spec]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L319-L346
+[p-pool-resolve]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/execution/async_compile.py#L287
+[p-pool-tests]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/tests/inductor/test_kernel_launchspec.py#L355-L361
+[p-readme]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/README.md
+[p-readme-strided]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/README.md#L164-L174
+[p-record]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/spyre_kernel.py#L1368-L1411
+[p-record-call]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/spyre_kernel.py#L1816
+[p-record-skip]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/spyre_kernel.py#L1385-L1410
+[p-role-merge]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/spyre_kernel.py#L1393-L1396
+[p-runner-call]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/core.py#L18-L37
+[p-spec-path]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L294-L295
+[p-spyre-layout]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L220-L258
+[p-stride-mismatch]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L326-L346
+[p-symbol-kinds-from-spec]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L92-L110
+[p-tensors-from-spec]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/extensions/spyre-cli/spyre_cli/launch_spec.py#L113-L169
+[p-unrecorded-test]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/tests/inductor/test_kernel_launchspec.py#L264-L289
+[p-unresolved]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/_inductor/codegen/kernel_launchspec.py#L261-L283
+[p-write]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/execution/async_compile.py#L261-L300
+[p-write-ktir]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/execution/async_compile.py#L898
+[p-write-sdsc]: https://github.com/dushyantbehl/torch-spyre/blob/29cbdd20c4fd1934f2143b4d9131cc9e30b1e401/torch_spyre/execution/async_compile.py#L255-L256
