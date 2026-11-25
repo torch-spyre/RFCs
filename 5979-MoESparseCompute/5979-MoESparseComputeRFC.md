@@ -82,6 +82,8 @@ The router turns the dense `[Tq,E]` routing weights into per-expert packed token
 * A scatter of only those `Tq·K` entries (A17b) packs the token ids into the per-expert lists. Unwritten slots keep the pad token from a bulk init.
 * In the expert loop, each tile's token ids address the gathers directly, and each token's routing weight is gathered by token id from a weight tensor with one stick per (token, expert).
 
+A step-by-step visual walkthrough of this router on a toy routing is in [the router walkthrough](5979-MoESparseComputeRouterWalkthrough.md).
+
 A scatter or gather moves whole sticks, so an element placed on its own must occupy a full stick (a dummy dim in the stick). The earlier version of this router did that for all `Tq·E` entries (128 MB per scatter, 15 of every 16 writes into the sink row); this version does it only for the `Tq·K` real entries, and the replicated source is a constant.
 
 Input: `x : [Tq, dmodel]`, stick dim `dmodel`
