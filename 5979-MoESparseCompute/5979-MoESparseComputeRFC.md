@@ -10,6 +10,7 @@ This RFC proposes sparse kernels for the MoE (sparse FFN) block on Spyre, using 
 * **Decode:** there is no per-token loop. The whole batch runs through each *selected* expert in a dynamic loop over the `E_sel` distinct experts chosen anywhere in the batch, so each selected expert's weights are fetched once.
 * **Shared experts** run on all tokens in both phases.
 * The router needs two **new ops** (`non_zero_pos_to_idx`, `count_non_zero_div_ceil`) and changes to two existing ones.
+* **Router list build (revised):** the per-expert token lists are built from the token view directly. Only the `Tq·K` real (token, expert) entries are scattered (65,536 sticks instead of 1,048,576), into an expert-major list, with no sink writes and no per-expert weight scatter. This removes the router's main bottleneck, the `Tq·E` scatters A16a/A16b, and makes the router about 4–6× faster per chunk (see [Router cost](#router-cost)). It adds no new op.
 
 Across devices, the block uses tensor parallelism: each device holds a `1/D` slice of every expert's intermediate dim, and an AllReduce at the end combines the partial outputs.
 
@@ -74,13 +75,16 @@ A tile with fewer than 512 real tokens is padded with **dummy tokens**. These re
 
 The router turns the dense `[Tq,E]` routing weights into per-expert packed token lists:
 
-* `non_zero_pos_to_idx` gives each (token, expert) entry its slot in the expert's list.
-* A scatter packs the routing weights and token ids into those slots.
-* `idx2Addr` converts the packed token ids into row addresses for the input and output gathers.
+* `non_zero_pos_to_idx` gives each (token, expert) entry its slot in the expert's list. Adding a constant per-expert base turns the slot into the entry's address in one expert-major list.
+* `topk` over E keeps, for each token, the addresses of its K selected entries (a `[Tq,K]` list, the token view).
+* A scatter of only those `Tq·K` entries packs the token ids into the per-expert lists. Unwritten slots keep the pad token from a bulk init.
+* In the expert loop, each tile's token ids address the gathers directly, and each token's routing weight is gathered by token id from a weight tensor with one stick per (token, expert).
+
+A scatter or gather moves whole sticks, so an element placed on its own must occupy a full stick (a dummy dim in the stick). The earlier version of this router did that for all `Tq·E` entries (128 MB per scatter, 15 of every 16 writes into the sink row); this version does it only for the `Tq·K` real entries, and the replicated source is a constant.
 
 Input: `x : [Tq, dmodel]`, stick dim `dmodel`
 
-Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id scatter (A16b) directly and is the same for every expert
+Constants, precomputed: `tok_ids : [Tq, 1, 32]` int32, token id `t` replicated in its own stick (feeds the scatter A17b, broadcast over K); `seed : [1, E]` fp32 = `e·Tq` (A13)
 
 **Router**
 
@@ -96,40 +100,41 @@ Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id 
 | A8 | `restickify` | `[Tq,E]` (A7) | `[Tq, E]` | df16 | `E` | stick dim `Tq`→`E`; brings `E` back into the stick |
 | A9 | `df16tofp32` | `[Tq,E]` (A8) | `[Tq, E]` | fp32 | `E` (32) | 32 `E` per stick. Output is **staggered** along `E`: each 64-wide df16 stick yields fp32 sticks holding `0..3, 8..11, …` then `4..7, 12..15, …`. fp32 is needed because token ids up to `Tq = 8192` aren't exact in df16 |
 | A10 | `unstagger_stick_ea` | `[Tq,E]` (A9) | `score [Tq, E]` | fp32 | `E` (32) | restores contiguous `E` order |
-| A11 | `non_zero_pos_to_idx` (dim=Tq) **[NEW]** | `score[Tq,E]` (A10) | `run_pos [Tq, E]` | fp32 | `E` (32) | scans **across** sticks along `Tq`, independently per `E` lane. Non-zero entry → number of non-zeros before it in this `E` column (its slot in the expert's list); zero entry → dummy location `Tq` (the `(Tq+1)`-th row), given as the op's `padval` parameter |
+| A11 | `non_zero_pos_to_idx` (dim=Tq, padval=−∞) **[NEW]** | `score[Tq,E]` (A10) | `run_pos [Tq, E]` | fp32 | `E` (32) | scans **across** sticks along `Tq`, independently per `E` lane. Non-zero entry → number of non-zeros before it in this `E` column (its slot in the expert's list); zero entry → `padval`. `padval` must be −∞ so that A13 cannot turn it into a valid address |
 | A12 | `count_non_zero_div_ceil` (dim=Tq, divisor=G) **[NEW]** | `score[Tq,E]` (A10) | `nc [1, E]` | fp32 | `E` (32) | counts non-zeros along `Tq` per `E` lane (`cnt[e]`), divides by `G` and rounds up: `nc[e] = max(1, ⌈cnt[e]/G⌉)`. **A count of 0 gives 1**, so `nc[e] ≥ 1` |
-| A13 | `idx2Addr` | `run_pos[Tq,E]` (A11) | `run_addr [Tq, E]` | int32 | `E` (32) | slot → address in the `[Tq+1,E,32]` scatter destination (A15). Fed to the A16 scatters as is, with no dummy dim. Input `run_pos` is fp32. **Needs tweak — see [New and modified ops](#new-and-modified-ops)** |
-| A14a | `restickify` | `score[Tq,E]` (A10) | `[Tq, E, 32]` | fp32 | dummy (32) | puts a dummy dim into the stick — one full stick per (token, expert) entry |
-| A14b | `restickify` | `nc[1,E]` (A12) | `[1, E, 32]` | fp32 | dummy (32) | one stick per expert; source of the `nc[e]` loop bound |
-| A15 | `init` (fill = `Tq`) | — | `[Tq+1, E, 32]` | fp32 / int32 | dummy (32) | every entry points at the dummy pad token (row `Tq` of `x_pad`, A19). Initial destination for A16a (fp32 copy) and A16b (int32 copy) |
-| A16a | `scatter` (score) | `[Tq,E,32]` (A14a), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | fp32 | dummy (32) | entry `(t,e)` → row `run_pos[t,e]`, expert `e`. Zero entries all land in dummy row `Tq` |
-| A16b | `scatter` (token id) | `tok_ids[Tq]` (constant), `run_addr[Tq,E]` (A13), dest (A15) | `[Tq+1, E, 32]` | int32 | dummy (32) | entry `(t,e)` writes token id `t` to row `run_pos[t,e]`, expert `e`; the same `tok_ids` is used for every `e`. **Slowest op:** each scatter is `Tq·E·128 B` = 128 MB at `E = 128`, ~256 MB for A16a+A16b ⇒ can take **~10+ ms**. WIP to optimize |
-| A17a | `restickify` | `[Tq+1,E,32]` (A16a) | `w_list [Tq+1, E]` | fp32 | `Tq` | brings `Tq` into the stick, drops the dummy dim. Column `e` = weights in slot order |
-| A17b | `restickify` | `[Tq+1,E,32]` (A16b) | `tok_list [Tq+1, E]` | int32 | `Tq` | as above. Column `e` = token ids routed to `e`, packed into slots `0..cnt[e]-1`; remaining slots = `Tq` (pad) |
+| A13 | `add` | `run_pos` (A11), `seed[1,E]` (constant, broadcast over Tq) | `key [Tq, E]` | fp32 | `E` (32) | `key = e·Tq + slot`: the entry's address in the expert-major list `[E·Tq]`. −∞ stays −∞. Exact in fp32 (max `E·Tq` = 1,048,576 < 2²⁴) |
+| A14 | `restickify` | `key[Tq,E]` (A13) | `[Tq, E]` | fp32 | `Tq` | stick dim `E`→`Tq`, as A3, so that A15 selects across sticks |
+| A15 | `topk` (values, K=8, dim=E) | `key[Tq,E]` (A14) | `addr_k [Tq, K]` | fp32 | `Tq` | each token has exactly K finite keys, so the top K are its selected entries; their order does not matter. This is the step from the token view to the expert view |
+| A16 | `idx2Addr` | `addr_k[Tq,K]` (A15) | `[Tq, K]` | int32 | `Tq` | `Tq·K` = 65,536 entries. Input is fp32 (same tweak as before, see [New and modified ops](#new-and-modified-ops)) |
+| A17a | `init` (fill = `Tq`) | — | `tok_dst [E·Tq, 32]` | int32 | dummy (32) | expert-major list, capacity `Tq` per expert: slot `s` of expert `e` is row `e·Tq + s`. Every slot starts as the pad token, so slots past `cnt[e]` need no masking later. Best done as a broadcast copy of a `[1,32]` constant (one device kernel), about 2× faster than a runtime fill |
+| A17b | `scatter` (token id) | `tok_ids[Tq,1,32]` (constant, broadcast over K), index A16, dest A17a | `tok_dst [E·Tq, 32]` | int32 | dummy (32) | one stick store per real (token, expert) pair: **65,536 stores** (16× fewer than each earlier scatter), no sink writes. Replaces A14a, A15, A16a/b, A17a/b of the earlier version |
+| A17c | `restickify` | `nc[1,E]` (A12) | `[1, E, 32]` | fp32 | dummy (32) | one stick per expert; source of the `nc[e]` loop bound (as before) |
+| A17w | `restickify` | `w_pad[Tq+1,E]` (A8 + zero pad row) | `w_dummy [Tq+1, E, 64]` | df16 | dummy (64) | one replicated stick per (token, expert) weight, rows outermost. The pad row should be handled so the rows still split evenly over all cores |
 | A18 | `zero_init` | — | `moe_out [Tq+1, dmodel]` | df16 | `dmodel` | partial-output space. Row `Tq` is a **sink** for dummy-slot writes |
-| A19 | `pad` | `x[Tq,dmodel]` (in) | `x_pad [Tq+1, dmodel]` | df16 | `dmodel` | appends 1 dummy token at row `Tq`, all zeros. Dummy slots of `w_list` keep the A15 fill value (`Tq`) rather than 0, so the pad token must be zero: the bias-free FFN then outputs 0 and the sink row stays finite |
-| A20 | `idx2Addr` (base = `x_pad`) | `tok_list[Tq+1,E]` (A17b) | `addr_in [Tq+1, E]` | int32 | `Tq` | token id → row address in `x_pad`. int32 input |
-| A21 | `idx2Addr` (base = `moe_out`) | `tok_list[Tq+1,E]` (A17b) | `addr_out [Tq+1, E]` | int32 | `Tq` | token id → row address in `moe_out` |
+| A19 | `pad` | `x[Tq,dmodel]` (in) | `x_pad [Tq+1, dmodel]` | df16 | `dmodel` | appends 1 dummy token at row `Tq`, all zeros. Padded slots hold the pad token `Tq`, so the pad token must be zero: the bias-free FFN then outputs 0 and the sink row stays finite |
+
+The full-list `idx2Addr` ops of the earlier version (A20, A21) are gone: each tile's token ids go straight to the gathers, which convert them to addresses themselves.
 
 **Routed experts**
 
-`nc[e] = max(1, ⌈cnt[e]/G⌉) ≥ 1` (A12 → A14b). Tile slots run up to `nc[e]·G − 1 ≤ Tq − 1`, since `nc[e]·G ≤ Tq` (`cnt[e] ≤ Tq`, `Tq` is a multiple of `G`, and `G ≤ Tq`), so tiles never read past `Tq+1` rows. Slots from `cnt[e]` up to the end of the last tile hold the pad id `Tq`. Those dummy tokens read `x_pad[Tq]` and write `moe_out[Tq]` (the sink).
+`nc[e] = max(1, ⌈cnt[e]/G⌉) ≥ 1` (A12 → A17c). Tile slots run up to `nc[e]·G − 1 ≤ Tq − 1`, since `nc[e]·G ≤ Tq` (`cnt[e] ≤ Tq`, `Tq` is a multiple of `G`, and `G ≤ Tq`), so tiles never read past `Tq+1` rows. Slots from `cnt[e]` up to the end of the last tile hold the pad id `Tq`. Those dummy tokens read `x_pad[Tq]` and write `moe_out[Tq]` (the sink).
 
 | # | Op | Inputs | Output shape | Precision | Stick dim | Notes |
 |---|---|---|---|---|---|---|
 | — | **loop `e = 0 .. E-1`:** | | | | | |
-| — | &nbsp;&nbsp;**loop `c = 0 .. nc[e]-1` (dynamic):** | | | | | slice `[c·G : (c+1)·G, e]` of `addr_in`, `addr_out`, `w_list` |
-| A22 | `gather` (input) | `x_pad[Tq+1,dmodel]` (A19), `addr_in[·,e]` (A20) | `exp_in [G, dmodel]` | df16 | `dmodel` | row gather — whole `dmodel` sticks per token |
+| — | &nbsp;&nbsp;**loop `c = 0 .. nc[e]-1` (dynamic):** | | | | | tile = slots `[c·G, (c+1)·G)` of expert `e`, i.e. rows `[e·Tq + c·G, +G)` of `tok_dst` (contiguous, stick-aligned since `G` is a multiple of the stick) |
+| A21t | `restickify` (lane 0) | `tok_dst[e·Tq + c·G : +G]` (A17b) | `tok [G]` | int32 | `G` | token ids of the tile; slots past `cnt[e]` already hold `Tq` (A17a). |
+| A22 | `gather` (input) | `x_pad[Tq+1,dmodel]` (A19), `tok` (A21t) | `exp_in [G, dmodel]` | df16 | `dmodel` | row gather — whole `dmodel` sticks per token |
 | A23 | `gate_proj` | `exp_in[G,dmodel]` (A22) × `W_gate[e][dmodel,dff_e]` | `[G, dff_e]` | df16 | `dff_e` | regular `512 × dmodel × dff_e` GEMM |
 | A24 | `up_proj` | `exp_in[G,dmodel]` (A22) × `W_up[e][dmodel,dff_e]` | `[G, dff_e]` | df16 | `dff_e` | weights for expert `e` reused across its `nc[e]` tiles |
 | A25 | `silu` | `[G,dff_e]` (A23) | `[G, dff_e]` | df16 | `dff_e` | on A23 only |
 | A26 | `mul` | `[G,dff_e]` (A25) × `[G,dff_e]` (A24) | `[G, dff_e]` | df16 | `dff_e` | `silu(gate) * up` |
 | A27 | `down_proj` | `[G,dff_e]` (A26) × `W_down[e][dff_e,dmodel]` | `[G, dmodel]` | df16 | `dmodel` | |
-| A28 | `restickify` | `w_list[c·G:(c+1)·G, e]` (A17a) | `w_tile [G, 32]` | fp32 | dummy (32) | stick dim `Tq`→dummy; one weight stick per token |
-| A29 | `mul` | `[G,dmodel]` (A27) × `w_tile[G,32]` (A28) | `[G, dmodel]` | df16 | `dmodel` | one weight stick broadcast across each token's `dmodel` sticks |
-| A30 | `gather` (partial out) | `moe_out[Tq+1,dmodel]` (A18 / A32), `addr_out[·,e]` (A21) | `[G, dmodel]` | df16 | `dmodel` | same tokens as A22 |
+| A28 | `gather` (routing weight) | `w_dummy[Tq+1,E,64]` (A17w), `tok` (A21t) | `w_tile [G, 64]` | df16 | dummy (64) | `G` single sticks `w_dummy[tok, e]`: the token's weight for expert `e`, already replicated across the stick. |
+| A29 | `mul` | `[G,dmodel]` (A27) × `w_tile[G,64]` (A28) | `[G, dmodel]` | df16 | `dmodel` | one weight stick broadcast across each token's `dmodel` sticks |
+| A30 | `gather` (partial out) | `moe_out[Tq+1,dmodel]` (A18 / A32), `tok` (A21t) | `[G, dmodel]` | df16 | `dmodel` | same tokens as A22 |
 | A31 | `add` | `[G,dmodel]` (A29) + `[G,dmodel]` (A30) | `[G, dmodel]` | df16 | `dmodel` | |
-| A32 | `scatter` | `[G,dmodel]` (A31), `addr_out[·,e]` (A21) | `moe_out [Tq+1, dmodel]` (in place) | df16 | `dmodel` | write back to the same rows. Dummy slots all hit sink row `Tq` |
+| A32 | `scatter` | `[G,dmodel]` (A31), `tok` (A21t) | `moe_out [Tq+1, dmodel]` (in place) | df16 | `dmodel` | write back to the same rows. Dummy slots all hit sink row `Tq` |
 | — | &nbsp;&nbsp;**end loop `c`** | | | | | |
 | — | **end loop `e`** | | | | | |
 
@@ -148,7 +153,7 @@ Constant: `tok_ids : [Tq]` int32 = `0 .. Tq-1`, precomputed. Feeds the token-id 
 
 Weight stick dims: `W_router[dmodel,E]` → `E`; `W_gate/W_up[E,dmodel,dff_e]` → `dff_e`; `W_down[E,dff_e,dmodel]` → `dmodel`.
 
-A33–A37 do not depend on the router or the routed loop (only A38 touches `moe_out`), so they can run concurrently or interleave to fill bubbles — e.g. overlap with the A16 scatters.
+A33–A37 do not depend on the router or the routed loop (only A38 touches `moe_out`), so they can run concurrently or interleave to fill bubbles — e.g. overlap with the router (A13–A17).
 
 ### Path B — Decode (whole batch × selected experts)
 
@@ -255,13 +260,27 @@ on each device d in parallel:
     y = all_reduce_sum(out_d)                # one collective per MoE block
 ```
 
+#### Router cost
+
+At Tq = 8192, E = 128, K = 8. The routed-expert compute (A22–A32) is the same in both versions.
+
+| | Earlier version (A14a–A21, A28) | Revised (A13–A17, A21t, A28) |
+|---|---|---|
+| Scattered sticks | 2 × 1,048,576 (A16a/b), 15/16 into the sink | 65,536 (A17b), none into a sink: 32× fewer |
+| Destination fills | 2 × 134 MB (A15) | 1 × 128 MB (A17a) |
+| Full-list restickifies | 2 × 134 MB (A17a/b) | none; each tile restickifies only its own `G` slots (A21t) |
+| Per tile | one restickify (A28) | one restickify (A21t) and one gather (A28) |
+| Router time per chunk | 1× | about 4–6× less |
+
+All ops used by the revised list build exist already (`add`, `restickify`, `topk`, `idx2Addr`, `init`, `scatter`, `gather`); the only op-level changes are the ones listed below.
+
 ### New and modified ops
 
 1. Matmul (decode B19, B20, B23): indirect access into the weight tensor; a `[B × dmodel]` GEMM rather than a GEMV.
-2. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location `Tq` / `E` for zero entries, passed as the op's `padval` parameter. The op interface specifies a single scan dimension, which cannot be split across cores. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
+2. `non_zero_pos_to_idx` (prefill A11, decode B13a): **new op**. One output: running position, with a dummy location for zero entries, passed as the op's `padval` parameter (prefill uses −∞, decode `E`). The op interface specifies a single scan dimension, which cannot be split across cores. The index values come from a constant id tensor (`tok_ids[Tq]` / `exp_ids[E]`) fed straight to the scatter.
 3. `count_non_zero_div_ceil` (prefill A12, decode B13b): **new op**. Count non-zeros along the reduction dimension, divide by `G` and round up, with 0 → 1. Decode uses divisor 1.
-4. `idx2Addr` (prefill A13, decode B14): accept fp32 input (`run_pos` from `non_zero_pos_to_idx`). The index tensor of an indirect access can be FP32, as long as it holds integer values. The other `idx2Addr` ops (A20, A21, B17a–d) take int32 lists scattered from the int32 constants.
-5. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A14b, decode expert loop `E_sel` from B13b):
+4. `idx2Addr` (prefill A16, decode B14): accept fp32 input (`addr_k` from `topk`, decode `run_pos` from `non_zero_pos_to_idx`). The index tensor of an indirect access can be FP32, as long as it holds integer values. The other `idx2Addr` ops (B17a–d) take int32 lists scattered from the int32 constants.
+5. Dynamic loops with data-dependent loop count (prefill tile loop `nc[e]` from A17c, decode expert loop `E_sel` from B13b):
    - a) SDSCbundle interface: `sdscbundle.load_value_at_address` reads the loop count from a tensor address, stored in FP32 as the first value of a stick, with `max_value` the largest count it can hold. Its result is the upper bound of the `scf.for`
    - b) Backend program looping where the loop count comes from a tensor read
 
@@ -271,7 +290,7 @@ on each device d in parallel:
 
 * MoE block latency for prefill (per chunk) and decode (per step), compared with the current dense prefill and per-pair decode paths.
 * Prefill: tokens actually computed per expert, compared with `Tq·K`. This measures padding overhead.
-* Prefill: router time, in particular the A16a/b scatters.
+* Prefill: router time, in particular the list build A13–A17 and the per-tile router work (A21t, A28).
 * Decode: weight bytes fetched per step, compared with `E_sel · (per-expert weight size)`.
 
 ## **Alternatives**
@@ -290,7 +309,7 @@ The prefill structure follows the usual sparse-MoE kernel pattern of per-expert 
 
 ## **Unresolved questions**
 
-* How to optimize the prefill router scatters (A16a/b).
+* ~~How to optimize the prefill router scatters (A16a/b).~~ Addressed by the revised list build (A13–A17).
 
 ## Resolution
 
