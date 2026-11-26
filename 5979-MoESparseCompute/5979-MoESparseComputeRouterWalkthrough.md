@@ -60,7 +60,7 @@ A12 `count_non_zero_div_ceil` counts the tokens of each expert and gives the num
 
 ### A17w: routing weights as one stick per (token, expert)
 
-A17w restickifies `w_pad [Tq+1, E]` df16 (A8 with a zero row appended, as in A19) into `w_dummy [Tq+1, E, 64]` df16: one replicated stick per (token, expert) weight, rows outermost. The loop can then fetch a token's weight for expert `e` as a single stick by token id (A28). The pad row should be handled so that the rows still split evenly over all cores.
+A17w restickifies `w_pad [Tq+16, E]` df16 (A8 with 16 zero rows appended; row `Tq` is the pad token's zero row) into `w_dummy [Tq+16, E, 64]` df16: one replicated stick per (token, expert) weight, rows outermost. The loop can then fetch a token's weight for expert `e` as a single stick by token id (A28). Appending 16 rows rather than 1 keeps the work split evenly over all cores; rows past `Tq` are never read. The toy draws only the pad row `Tq`.
 
 ![A17w on the toy routing](assets/router-step-a17w.svg)
 
@@ -74,7 +74,7 @@ Tile `c` of expert `e` is slots `[c·G, (c+1)·G)`, rows `[e·Tq + c·G, +G)` of
 
 ### A22, A28, A30, A32: the indirect accesses
 
-A22, A28, A30 and A32 take `tok` directly. The backend inserts one conversion in front of each: A22i (base `x_pad`), A28i (the address of `w_dummy[tok, e]`: row `tok`, expert `e`), A30i and A32i (base `moe_out`). Each converts one tile, `tok [G]` int32 to `[G]` int32, `G` = 512 entries at real size. A28 gathers `G` single sticks `w_dummy[tok, e]`: `w_tile [G, 64]`, the token's weight for expert `e`, already replicated across the stick, which A29 multiplies into each token's `dmodel` sticks. The pad token reads the zero row `Tq` of `x_pad` and writes the sink row `Tq` of `moe_out`, so its results are discarded.
+A22, A28, A30 and A32 take `tok` directly. The backend inserts one conversion in front of each: A22i (base `x_pad`), A28i (the address of `w_dummy[tok, e]`: row `tok`, expert `e`), A30i and A32i (base `moe_out`). Each converts one tile, `tok [G]` int32 to `[G]` int32, `G` = 512 entries at real size. A28 gathers `G` single sticks `w_dummy[tok, e]` from `w_dummy [Tq+16, E, 64]`: `w_tile [G, 64]`, the token's weight for expert `e`, already replicated across the stick, which A29 multiplies into each token's `dmodel` sticks. The pad token reads the zero row `Tq` of `x_pad` and writes the sink row `Tq` of `moe_out`, so its results are discarded.
 
 ![Indirect accesses of one tile](assets/router-step-loop.svg)
 

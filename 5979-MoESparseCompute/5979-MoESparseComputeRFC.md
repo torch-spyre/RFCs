@@ -113,7 +113,7 @@ Constants, precomputed: `tok_ids : [Tq, 1, 32]` int32, token id `t` replicated i
 | A17bi | `idx2Addr` *(inserted by the backend)* | `addr_k[Tq,K]` (A15) | `[Tq, K]` | int32 (input fp32) | `Tq` | not emitted by the frontend: the backend converts `addr_k` in front of A17b. `Tq·K` = 65,536 entries, fp32 input (see [New and modified ops](#new-and-modified-ops)) |
 | A17b | `scatter` (token id) | `tok_ids[Tq,1,32]` (constant, broadcast over K), index `addr_k` (A15), dest A17a | `tok_dst [E·Tq, 32]` | int32 | dummy (32) | one stick store per real (token, expert) pair: **65,536 stores** (16× fewer than each earlier scatter), no sink writes. Replaces A14a, A15, A16a/b, A17a/b of the earlier version |
 | A17c | `restickify` | `nc[1,E]` (A12) | `[1, E, 32]` | fp32 | dummy (32) | one stick per expert; source of the `nc[e]` loop bound (as before) |
-| A17w | `restickify` | `w_pad[Tq+1,E]` (A8 with a zero row appended, as in A19) | `w_dummy [Tq+1, E, 64]` | df16 | dummy (64) | one replicated stick per (token, expert) weight, rows outermost. The pad row should be handled so the rows still split evenly over all cores |
+| A17w | `restickify` | `w_pad[Tq+16,E]` (A8 with 16 zero rows appended; row `Tq` is the pad token's zero row) | `w_dummy [Tq+16, E, 64]` | df16 | dummy (64) | one replicated stick per (token, expert) weight, rows outermost. Suggestion: appending 16 rows rather than 1 keeps the work split evenly over all cores (with `Tq+1` rows the split falls back to few cores); rows past `Tq` are never read |
 | A18 | `zero_init` | — | `moe_out [Tq+1, dmodel]` | df16 | `dmodel` | partial-output space. Row `Tq` is a **sink** for dummy-slot writes |
 | A19 | `pad` | `x[Tq,dmodel]` (in) | `x_pad [Tq+1, dmodel]` | df16 | `dmodel` | appends 1 dummy token at row `Tq`, all zeros. Padded slots hold the pad token `Tq`, so the pad token must be zero: the bias-free FFN then outputs 0 and the sink row stays finite |
 
@@ -136,7 +136,7 @@ Each tile's token ids go straight to the gathers and the scatter of the loop (A2
 | A26 | `mul` | `[G,dff_e]` (A25) × `[G,dff_e]` (A24) | `[G, dff_e]` | df16 | `dff_e` | `silu(gate) * up` |
 | A27 | `down_proj` | `[G,dff_e]` (A26) × `W_down[e][dff_e,dmodel]` | `[G, dmodel]` | df16 | `dmodel` | |
 | A28i | `idx2Addr` *(inserted by the backend)* (base = `w_dummy`) | `tok [G]` (A21t), one tile | `[G]` (one tile) | int32 | `G` | token id → address of `w_dummy[tok, e]`, right in front of A28; not emitted by the frontend |
-| A28 | `gather` (routing weight) | `w_dummy[Tq+1,E,64]` (A17w), `tok` (A21t) | `w_tile [G, 64]` | df16 | dummy (64) | `G` single sticks `w_dummy[tok, e]`: the token's weight for expert `e`, already replicated across the stick. |
+| A28 | `gather` (routing weight) | `w_dummy[Tq+16,E,64]` (A17w), `tok` (A21t) | `w_tile [G, 64]` | df16 | dummy (64) | `G` single sticks `w_dummy[tok, e]`: the token's weight for expert `e`, already replicated across the stick. |
 | A29 | `mul` | `[G,dmodel]` (A27) × `w_tile[G,64]` (A28) | `[G, dmodel]` | df16 | `dmodel` | one weight stick broadcast across each token's `dmodel` sticks |
 | A30i | `idx2Addr` *(inserted by the backend)* (base = `moe_out`) | `tok [G]` (A21t), one tile | `[G]` (one tile) | int32 | `G` | token id → row address in `moe_out`, right in front of A30; not emitted by the frontend |
 | A30 | `gather` (partial out) | `moe_out[Tq+1,dmodel]` (A18 / A32), `tok` (A21t) | `[G, dmodel]` | df16 | `dmodel` | same tokens as A22 |
