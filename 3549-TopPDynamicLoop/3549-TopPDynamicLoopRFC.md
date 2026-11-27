@@ -11,7 +11,7 @@ This RFC proposes how to compute the top-p (nucleus) candidates of a batch of ro
 * Each iteration also makes the **exact cut** within its group: it keeps the candidates of each row up to the one that brings its mass to `p`, and sets the others to 0.
 * The whole computation is one bundle. Its outputs are what the sampler needs: candidate token ids and their probabilities, with 0 for every candidate not kept.
 
-No new op is needed, although a dedicated cumsum is recommended. The RFC relies on a loop bound read from device memory with `sdscbundle.load_value_at_address`, and it proposes one sentence for the spec to allow writing that bound from inside the loop it bounds.
+The cumsum it needs is a native op (backend PR 5023), so no other new op is needed. The RFC relies on a loop bound read from device memory with `sdscbundle.load_value_at_address`, and it proposes one sentence for the spec to allow writing that bound from inside the loop it bounds.
 
 ## **Motivation**
 
@@ -111,7 +111,7 @@ The loop bound needs no initial value: the loop reads it only at the end of an i
 | T1 | `topkindex` (k=G, dim=V) | `probs[V,B]` | `cand_tok[gG:(g+1)G, B]` | fp32 | `B` | ids of the next 128 of each row. The output address is affine in `g` |
 | T2 | `topkvalue` (k=G, dim=V) | `probs[V,B]` | `cand_prob[gG:(g+1)G, B]` | fp32 | `B` | the same scan, so the same order as T1, descending |
 | T3 | `maskbyindex` (maskval=0) | `probs[V,B]`, `cand_tok` group (T1) | `probs [V, B]` (in place) | fp32 | `B` | the next T1/T2 find the 128 after these |
-| T4 | `cumsum` (dim=G) | `cand_prob` group (T2) | `cs [G, B]` | fp32 | `B` | **a dedicated cumsum op is recommended** (see [Op changes](#op-changes)); until it exists, the existing decomposition of `torch.cumsum` on device ([#3389](https://github.com/torch-spyre/torch-spyre/pull/3389)) |
+| T4 | `cumsum` (dim=G) | `cand_prob` group (T2) | `cs [G, B]` | fp32 | `B` | the native `cumsum` op (see [Op changes](#op-changes)), instead of the decomposition of `torch.cumsum` on device ([#3389](https://github.com/torch-spyre/torch-spyre/pull/3389)) |
 | T5 | `sub`, `add` | `cs` (T4), `cand_prob` group, `acc` | `before [G, B]` | fp32 | `B` | `acc + cs − cand_prob`: the mass before each candidate. `acc` is broadcast over the group |
 | T6 | `greaterequal` | `before` (T5), `p` | `drop [G, B]` | fp32 | `B` | 1 for a candidate after the mass reached `p`, else 0 |
 | T7 | `where3` | `drop` (T6), `zero`, `cand_prob` group | `cand_prob` group (in place) | fp32 | `B` | the exact cut: 0 past it |
@@ -127,7 +127,7 @@ After iteration `g`, every row still below `p` has `ngroups[b] = g+2`, and every
 
 **The cut.** The groups are in descending order one after the other, not only within each: every group comes from what the earlier ones left. So `before` is the mass of all of the row's candidates ahead of this one, and a candidate is kept while that is below `p`. The rule also drops the whole group of a row that reached `p` in an earlier iteration, while the loop goes on for the rest of the batch, because its `before` starts at `acc ≥ p`.
 
-The example [`top_p_bundle.mlir`](top_p_bundle.mlir) is the whole bundle, with `V = 131072` (so `Gmax = 1024`, `R = V`), written with the dedicated cumsum. Each SDSC is named after its op.
+The example [`top_p_bundle.mlir`](top_p_bundle.mlir) is the whole bundle, with `V = 131072` (so `Gmax = 1024`, `R = V`), written with the native cumsum. Each SDSC is named after its op.
 
 ### Interface change: a bound written in its own loop
 
@@ -157,7 +157,7 @@ The SuperDSC-Bundle spec says a loop bounded by `sdscbundle.load_value_at_addres
 
 ### Op changes
 
-* **A dedicated cumsum is recommended** ([#3388](https://github.com/torch-spyre/torch-spyre/issues/3388)). Until it exists, T4 uses the existing decomposition of `torch.cumsum` on device ([#3389](https://github.com/torch-spyre/torch-spyre/pull/3389)), and the RFC works with either. What held a cumsum op back was the SDSC interface: it had no way to name a dim that an op scans along without reducing it. `non_zero_pos_to_idx` added that, as `scanDim_` in the op's attributes, so a cumsum can be specified the same way: the same shape and layout in and out, `scanDim_` not in the stick and not split across cores.
+* **T4 uses the native `cumsum` op** ([#3388](https://github.com/torch-spyre/torch-spyre/issues/3388)), now in the backend (PR 5023), together with `cumprod`, `cummax` and `cummin`. The frontend should lower `torch.cumsum` to it instead of the decomposition ([#3389](https://github.com/torch-spyre/torch-spyre/pull/3389)): one SDSC instead of `log2 n` full passes. What held a cumsum op back was the SDSC interface: it had no way to name a dim that an op scans along without reducing it. `non_zero_pos_to_idx` added that, as `scanDim_` in the op's attributes, and the cumulative ops are specified the same way: the same shape and layout in and out, `scanDim_` not in the stick and not split across cores ([interface-specs#24](https://github.com/torch-spyre/interface-specs/pull/24)).
 * **A topk with both outputs**, values and indices from one scan, would save T2's pass over `probs`: two passes per group instead of three. It needs enabling both in the frontend, where `topk` is decomposed into the two ops, and in the backend.
 
 ## **Metrics**
@@ -183,7 +183,7 @@ Top-p in PyTorch and Hugging Face sorts the probabilities, takes a cumsum and cu
 ## **Unresolved questions**
 
 * The frontend side of the in-place `maskbyindex` (T3).
-* The spec sentence for a bound written inside its own loop, and a hardware check of it.
+* The spec sentence for a bound written inside its own loop ([interface-specs#24](https://github.com/torch-spyre/interface-specs/pull/24)), and a hardware check of it.
 * Combining with a top-k per row: also drop the candidates past `k[b]`, and take `max_value = ⌈max k/128⌉`.
 
 ## Resolution

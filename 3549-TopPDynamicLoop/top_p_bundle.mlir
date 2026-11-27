@@ -67,8 +67,7 @@ module {
       sdscbundle.sdsc_execute (%probs, %prob_g) {sdsc_filename="sdsc_4_topkvalue.json", symbol_ids=[-9, -10]}
       // T3 maskbyindex maskval=0, in place: the next topk finds the 128 after these
       sdscbundle.sdsc_execute (%probs, %tok_g, %probs) {sdsc_filename="sdsc_5_maskbyindex.json", symbol_ids=[-11, -12, -13]}
-      // T4 cumsum over the group's 128 rows (the dedicated op; until it exists, the frontend's
-      // decomposition of torch.cumsum takes the place of this SDSC)
+      // T4 cumsum over the group's 128 rows, the native op
       sdscbundle.sdsc_execute (%prob_g, %cs) {sdsc_filename="sdsc_6_cumsum.json", symbol_ids=[-14, -15]}
       // T5 before = acc + cs - cand_prob: the mass before each candidate, acc broadcast over the group
       sdscbundle.sdsc_execute (%cs, %prob_g, %before) {sdsc_filename="sdsc_7_sub.json", symbol_ids=[-16, -17, -18]}
